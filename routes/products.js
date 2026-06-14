@@ -3,8 +3,11 @@ const Product = require('../models/Product');
 const { protect } = require('../middleware/auth');
 const { allowRoles } = require('../middleware/roleCheck');
 const { body, validationResult } = require('express-validator');
+const { sanitizeBody } = require('../middleware/sanitize');
 
 const router = express.Router();
+
+
 
 // Get all products (public – no auth needed)
 router.get('/', async (req, res) => {
@@ -43,6 +46,7 @@ router.get('/:id', async (req, res) => {
 
 // Create product (vendor, admin, owner)
 router.post('/', protect, allowRoles('vendor', 'admin', 'owner'), [
+  sanitizeBody(['name', 'description']),
   body('name').trim().notEmpty(),
   body('description').trim().notEmpty(),
   body('price').isFloat({ min: 0 }),
@@ -82,7 +86,7 @@ router.post('/', protect, allowRoles('vendor', 'admin', 'owner'), [
 });
 
 // Update product (vendor can update own, admin/owner any)
-router.put('/:id', protect, async (req, res) => {
+router.put('/:id', protect, sanitizeBody(['name', 'description']), async (req, res) => {
   try {
     const product = await Product.findById(req.params.id);
     if (!product) return res.status(404).json({ error: 'Product not found' });

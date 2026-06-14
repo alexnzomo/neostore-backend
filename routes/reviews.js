@@ -2,6 +2,7 @@ const express = require('express');
 const Review = require('../models/Review');
 const Order = require('../models/Order');
 const { protect } = require('../middleware/auth');
+const { sanitizeBody } = require('../middleware/sanitize');
 
 const router = express.Router();
 
@@ -16,7 +17,7 @@ router.get('/product/:productId', async (req, res) => {
 });
 
 // Submit a review (only if user purchased the product)
-router.post('/', protect, async (req, res) => {
+router.post('/', protect, sanitizeBody(['comment']), async (req, res) => {
   try {
     const { productId, rating, comment } = req.body;
     // Check if user has purchased this product

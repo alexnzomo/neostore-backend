@@ -13,6 +13,12 @@ const orderSchema = new mongoose.Schema({
   customerName: { type: String, required: true },
   customerEmail: { type: String, required: true },
   customerPhone: { type: String, required: true },
+  // Add these fields to your orderSchema
+  mpesaMerchantRequestId: { type: String, default: null },
+  mpesaCheckoutRequestId: { type: String, default: null },
+  mpesaTransactionId: { type: String, default: null },
+  mpesaFailureReason: { type: String, default: null },
+  stripePaymentIntentId: { type: String, default: null },
   deliveryInfo: {
     type: { type: String, enum: ['delivery', 'pickup'], required: true },
     address: String,

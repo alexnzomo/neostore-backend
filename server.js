@@ -9,6 +9,10 @@ const axios = require('axios');
 const SibApiV3Sdk = require('sib-api-v3-sdk');
 const bcrypt = require('bcrypt');
 
+const compression = require('compression');
+const morgan = require('morgan');
+const sanitizeHtml = require('sanitize-html');
+
 const app = express();
 
 // ---------- Security & middleware ----------
@@ -17,12 +21,50 @@ app.use(cors({ origin: process.env.CORS_ORIGIN, credentials: true }));
 app.use(cookieParser());
 app.use(express.json({ limit: '10mb' }));
 
+// Compression and logging
+app.use(compression());
+app.use(morgan('combined'));
+
 // Global rate limit
 const limiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 100,
 });
 app.use('/api/', limiter);
+
+// Stripe webhook (needs raw body) - MUST be before express.json()
+app.post('/api/stripe/webhook', express.raw({type: 'application/json'}), async (req, res) => {
+    const sig = req.headers['stripe-signature'];
+    let event;
+    try {
+        event = stripe.webhooks.constructEvent(req.body, sig, process.env.STRIPE_WEBHOOK_SECRET);
+    } catch (err) {
+        console.log(`⚠️ Webhook signature verification failed.`, err.message);
+        return res.status(400).send(`Webhook Error: ${err.message}`);
+    }
+    switch (event.type) {
+        case 'payment_intent.succeeded':
+            const paymentIntent = event.data.object;
+            const orderId = paymentIntent.metadata.orderId;
+            console.log(`PaymentIntent for Order ${orderId} succeeded!`);
+            if (orderId) {
+                const Order = require('./models/Order');
+                await Order.findByIdAndUpdate(orderId, { paymentStatus: 'fully_paid', stripePaymentIntentId: paymentIntent.id });
+            }
+            break;
+        case 'payment_intent.payment_failed':
+            const failedIntent = event.data.object;
+            console.log(`Payment failed for Order ${failedIntent.metadata.orderId}: ${failedIntent.last_payment_error?.message}`);
+            if (failedIntent.metadata.orderId) {
+                const Order = require('./models/Order');
+                await Order.findByIdAndUpdate(failedIntent.metadata.orderId, { paymentStatus: 'payment_failed' });
+            }
+            break;
+        default:
+            console.log(`Unhandled event type ${event.type}`);
+    }
+    res.json({ received: true });
+});
 
 // ---------- MongoDB connection ----------
 mongoose.connect(process.env.MONGO_URI)
@@ -139,6 +181,18 @@ app.post('/api/mpesa/stkpush', protect, async (req, res) => {
       },
       { headers: { Authorization: `Bearer ${token}` } }
     );
+
+  const mpesaResponse = response.data;
+  if (mpesaResponse.ResponseCode === "0") {
+      const { orderId } = req.body; // Make sure frontend sends orderId
+      if (orderId) {
+          const Order = require('./models/Order');
+          await Order.findByIdAndUpdate(orderId, {
+              mpesaMerchantRequestId: mpesaResponse.MerchantRequestID,
+              mpesaCheckoutRequestId: mpesaResponse.CheckoutRequestID
+          });
+      }
+  }
     res.json({ success: true, data: response.data });
   } catch (error) {
     console.error(error.response?.data || error.message);
@@ -146,10 +200,40 @@ app.post('/api/mpesa/stkpush', protect, async (req, res) => {
   }
 });
 
-// M-Pesa callback (public – Safaricom calls it)
-app.post('/callback', (req, res) => {
-  console.log('Callback received:', JSON.stringify(req.body, null, 2));
-  res.json({ ResultCode: 0, ResultDesc: 'Success' });
+// M-Pesa Callback (Safaricom calls this)
+app.post('/api/mpesa/callback', async (req, res) => {
+    console.log('M-Pesa Callback received:', JSON.stringify(req.body, null, 2));
+    try {
+        const callbackData = req.body.Body.stkCallback;
+        const resultCode = callbackData.ResultCode; // 0 = success
+        const merchantRequestId = callbackData.MerchantRequestID;
+        const transactionId = callbackData.CallbackMetadata?.Item?.find(item => item.Name === "MpesaReceiptNumber")?.Value;
+        const amount = callbackData.CallbackMetadata?.Item?.find(item => item.Name === "Amount")?.Value;
+
+        const Order = require('./models/Order');
+        const order = await Order.findOne({ mpesaMerchantRequestId: merchantRequestId });
+        if (!order) {
+            console.error(`Order not found for MerchantRequestID: ${merchantRequestId}`);
+            return res.status(404).json({ ResultCode: 1, ResultDesc: "Order not found" });
+        }
+
+        if (resultCode === 0) {
+            order.paymentStatus = 'fully_paid';
+            order.mpesaTransactionId = transactionId;
+            order.mpesaAmount = amount;
+            await order.save();
+            console.log(`Order ${order.orderId} payment confirmed via M-Pesa. Transaction ID: ${transactionId}`);
+        } else {
+            order.paymentStatus = 'payment_failed';
+            order.mpesaFailureReason = callbackData.ResultDesc;
+            await order.save();
+            console.log(`Order ${order.orderId} M-Pesa payment failed: ${callbackData.ResultDesc}`);
+        }
+        res.json({ ResultCode: 0, ResultDesc: "Success" });
+    } catch (error) {
+        console.error('M-Pesa callback error:', error);
+        res.status(500).json({ ResultCode: 1, ResultDesc: "Internal server error" });
+    }
 });
 
 // ---------- Email endpoints (full, as in your original) ----------
