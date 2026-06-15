@@ -8,6 +8,7 @@ const rateLimit = require('express-rate-limit');
 const axios = require('axios');
 const SibApiV3Sdk = require('sib-api-v3-sdk');
 const bcrypt = require('bcrypt');
+const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
 
 const compression = require('compression');
 const morgan = require('morgan');
@@ -111,6 +112,9 @@ const orderRoutes = require('./routes/orders');
 const pickupRoutes = require('./routes/pickup');
 const applicationRoutes = require('./routes/applications');
 const reviewRoutes = require('./routes/reviews');
+const settingsRoutes = require('./routes/settings');
+const discountRoutes = require('./routes/discounts');
+const pickupApplicationRoutes = require('./routes/pickupApplications');
 
 app.use('/api/auth', authRoutes);
 app.use('/api/users', userRoutes);
@@ -121,6 +125,9 @@ app.use('/api/orders', orderRoutes);
 app.use('/api/pickup', pickupRoutes);
 app.use('/api/applications', applicationRoutes);
 app.use('/api/reviews', reviewRoutes);
+app.use('/api/settings', settingsRoutes);
+app.use('/api/discounts', discountRoutes);
+app.use('/api/pickup/applications', pickupApplicationRoutes);
 
 // ---------- Auth middleware for payment endpoints ----------
 const { protect } = require('./middleware/auth');
@@ -400,7 +407,7 @@ app.post('/api/verify-code', (req, res) => {
 });
 
 // ---------- Stripe Payment Intent (protected) ----------
-const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
+
 
 app.post('/api/create-payment-intent', protect, async (req, res) => {
   const { amount, currency, paymentMethodId, orderId } = req.body;

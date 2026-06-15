@@ -7,6 +7,16 @@ const { allowRoles } = require('../middleware/roleCheck');
 
 const router = express.Router();
 
+// Get all orders (admin, owner, station_manager)
+router.get('/', protect, allowRoles('admin', 'owner', 'station_manager'), async (req, res) => {
+  try {
+    const orders = await Order.find().sort({ createdAt: -1 });
+    res.json(orders);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // Create order (checkout) – protected
 router.post('/', protect, async (req, res) => {
   try {
@@ -105,6 +115,16 @@ router.get('/my', protect, async (req, res) => {
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
+});
+
+// Assign agent to order (admin/owner only)
+router.put('/:id/assign-agent', protect, allowRoles('admin', 'owner'), async (req, res) => {
+  const { agentId } = req.body;
+  const order = await Order.findById(req.params.id);
+  if (!order) return res.status(404).json({ error: 'Order not found' });
+  order.assignedAgentId = agentId || null;
+  await order.save();
+  res.json(order);
 });
 
 // Get single order
