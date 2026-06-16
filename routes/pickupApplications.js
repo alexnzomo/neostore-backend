@@ -3,6 +3,7 @@ const PickupApplication = require('../models/PickupApplication');
 const PickupStation = require('../models/PickupStation');
 const { protect } = require('../middleware/auth');
 const { allowRoles } = require('../middleware/roleCheck');
+const User = require('../models/User');
 
 const router = express.Router();
 
@@ -57,10 +58,13 @@ router.put('/:id', protect, allowRoles('admin', 'owner'), async (req, res) => {
       phone: application.phone,
       email: application.email || '',
       hours: application.hours || '',
+      managerId: application.userId,   // Link the applicant as station manager
       approvedBy: req.user._id,
       approvedAt: new Date()
     });
     await newStation.save();
+    // Also update the user's stationId
+    await User.findByIdAndUpdate(application.userId, { stationId: newStation._id });
   }
   res.json({ message: `Application ${status}` });
 });

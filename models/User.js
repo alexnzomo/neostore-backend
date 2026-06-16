@@ -13,7 +13,7 @@ const userSchema = new mongoose.Schema({
   },
   isSuspended: { type: Boolean, default: false },
   suspendedUntil: { type: Date },
-  walletBalance: { type: Number, default: 0 },
+  walletBalance: { type: Number, default: 0, min: 0 },
   referralCode: { type: String, unique: true, sparse: true },
   referredBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
   emailVerified: { type: Boolean, default: false },

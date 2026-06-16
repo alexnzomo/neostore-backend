@@ -7,11 +7,12 @@ const pickupStationSchema = new mongoose.Schema({
   county: { type: String, required: true },
   phone: { type: String, required: true },
   email: { type: String },
-  hours: { type: String }, // e.g., "Mon-Fri 9am-6pm"
+  hours: { type: String },
   location: {
     lat: Number,
     lng: Number
   },
+  managerId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null }, // <-- NEW FIELD
   approvedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
   approvedAt: { type: Date },
   createdAt: { type: Date, default: Date.now },

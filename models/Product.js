@@ -4,10 +4,10 @@ const productSchema = new mongoose.Schema({
   productId: { type: String, unique: true }, // e.g., PRD1001
   name: { type: String, required: true },
   description: { type: String, required: true },
-  price: { type: Number, required: true }, // USD
-  salePrice: { type: Number, default: null },
+  price: { type: Number, required: true, min: 0 }, // USD
+  salePrice: { type: Number, default: null, min: 0 },
   stock: { type: Number, required: true, min: 0 },
-  shippingFee: { type: Number, required: true, default: 100 }, // KES
+  shippingFee: { type: Number, required: true, default: 100, min: 0 }, // KES
   imageUrl: { type: String, required: true },
   category: { type: String, required: true },
   vendorId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },

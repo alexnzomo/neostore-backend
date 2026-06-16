@@ -2,15 +2,45 @@ const express = require('express');
 const Order = require('../models/Order');
 const Product = require('../models/Product');
 const User = require('../models/User');
+const PickupStation = require('../models/PickupStation');
 const { protect } = require('../middleware/auth');
 const { allowRoles } = require('../middleware/roleCheck');
 
 const router = express.Router();
 
+// Helper to check if a station manager is allowed to manage a given order
+async function canStationManageOrder(stationManagerId, order) {
+  // Only pickup orders can be managed by station managers
+  if (order.deliveryInfo.type !== 'pickup') return false;
+  // Get the station manager's linked station ID
+  const user = await User.findById(stationManagerId).select('stationId');
+  if (!user || !user.stationId) return false;
+  // Find the station by its ID
+  const station = await PickupStation.findById(user.stationId);
+  if (!station) return false;
+  // Verify the order belongs to that station (by station name)
+  return order.deliveryInfo.stationName === station.name;
+}
+
 // Get all orders (admin, owner, station_manager)
 router.get('/', protect, allowRoles('admin', 'owner', 'station_manager'), async (req, res) => {
   try {
-    const orders = await Order.find().sort({ createdAt: -1 });
+    let query = {};
+    // If station_manager, only return pickup orders for their station
+    if (req.user.role === 'station_manager') {
+      const user = await User.findById(req.user._id).select('stationId');
+      if (user && user.stationId) {
+        const station = await PickupStation.findById(user.stationId);
+        if (station) {
+          query = { 'deliveryInfo.type': 'pickup', 'deliveryInfo.stationName': station.name };
+        } else {
+          return res.json([]);
+        }
+      } else {
+        return res.json([]);
+      }
+    }
+    const orders = await Order.find(query).sort({ createdAt: -1 });
     res.json(orders);
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -29,6 +59,24 @@ router.post('/', protect, async (req, res) => {
       discountAmountKES
     } = req.body;
 
+    // Validate discount and deposit values
+    if (discountAmountKES !== undefined && discountAmountKES < 0) {
+      return res.status(400).json({ error: 'Discount amount cannot be negative' });
+    }
+    if (depositPercentage !== undefined && (depositPercentage < 0 || depositPercentage > 100)) {
+      return res.status(400).json({ error: 'Deposit percentage must be between 0 and 100' });
+    }
+
+    // Validate items and quantities
+    if (!items || !Array.isArray(items) || items.length === 0) {
+      return res.status(400).json({ error: 'At least one item is required' });
+    }
+    for (const item of items) {
+      if (!item.productId || !item.quantity || item.quantity <= 0) {
+        return res.status(400).json({ error: 'Each item must have a valid product ID and positive quantity' });
+      }
+    }
+
     // Validate stock and calculate totals
     let subtotalUSD = 0;
     let shippingFeeKES = 0;
@@ -41,6 +89,9 @@ router.post('/', protect, async (req, res) => {
         return res.status(400).json({ error: `Insufficient stock for ${product.name}` });
       }
       const effectivePrice = product.salePrice && product.salePrice < product.price ? product.salePrice : product.price;
+      if (effectivePrice < 0) {
+        return res.status(400).json({ error: `Product ${product.name} has an invalid price` });
+      }
       subtotalUSD += effectivePrice * item.quantity;
       shippingFeeKES += (product.shippingFee || 100) * item.quantity;
       orderItems.push({
@@ -70,6 +121,8 @@ router.post('/', protect, async (req, res) => {
       depositPaid = 0;
       balanceDue = totalKES;
       paymentStatus = 'pending';
+    } else {
+      return res.status(400).json({ error: 'Invalid payment method' });
     }
 
     const orderId = await Order.getNextOrderId();
@@ -91,7 +144,9 @@ router.post('/', protect, async (req, res) => {
       paymentMethod,
       depositPaid,
       balanceDue,
-      assignedAgentId: null
+      assignedAgentId: null,
+      cashCollected: 0,
+      remainingBalance: balanceDue
     });
 
     // Deduct stock
@@ -132,7 +187,7 @@ router.get('/:id', protect, async (req, res) => {
   try {
     const order = await Order.findById(req.params.id);
     if (!order) return res.status(404).json({ error: 'Order not found' });
-    if (order.customerId.toString() !== req.user._id.toString() && !['admin', 'owner', 'agent'].includes(req.user.role)) {
+    if (order.customerId.toString() !== req.user._id.toString() && !['admin', 'owner', 'agent', 'station_manager'].includes(req.user.role)) {
       return res.status(403).json({ error: 'Not authorized' });
     }
     res.json(order);
@@ -141,12 +196,21 @@ router.get('/:id', protect, async (req, res) => {
   }
 });
 
-// Update delivery status (agent/admin/owner)
-router.put('/:id/status', protect, allowRoles('agent', 'admin', 'owner'), async (req, res) => {
+// Update delivery status (agent/admin/owner/station_manager)
+router.put('/:id/status', protect, allowRoles('agent', 'admin', 'owner', 'station_manager'), async (req, res) => {
   try {
     const { deliveryStatus } = req.body;
     const order = await Order.findById(req.params.id);
     if (!order) return res.status(404).json({ error: 'Order not found' });
+
+    // Extra validation for station managers
+    if (req.user.role === 'station_manager') {
+      const allowed = await canStationManageOrder(req.user._id, order);
+      if (!allowed) {
+        return res.status(403).json({ error: 'You can only update pickup orders for your station' });
+      }
+    }
+
     order.deliveryStatus = deliveryStatus;
     order.updatedAt = Date.now();
     await order.save();
@@ -156,18 +220,65 @@ router.put('/:id/status', protect, allowRoles('agent', 'admin', 'owner'), async 
   }
 });
 
-// Confirm cash payment (agent marks as cash collected)
-router.put('/:id/confirm-cash', protect, allowRoles('agent', 'admin', 'owner'), async (req, res) => {
+// Legacy confirm cash (marks entire order as cash_collected)
+router.put('/:id/confirm-cash', protect, allowRoles('agent', 'admin', 'owner', 'station_manager'), async (req, res) => {
   try {
     const order = await Order.findById(req.params.id);
     if (!order) return res.status(404).json({ error: 'Order not found' });
     if (order.paymentMethod !== 'cash_on_delivery') {
       return res.status(400).json({ error: 'Only cash on delivery orders can be confirmed this way' });
     }
+
+    // Station manager validation
+    if (req.user.role === 'station_manager') {
+      const allowed = await canStationManageOrder(req.user._id, order);
+      if (!allowed) {
+        return res.status(403).json({ error: 'You can only manage pickup orders for your station' });
+      }
+    }
+
     order.paymentStatus = 'cash_collected';
     order.updatedAt = Date.now();
     await order.save();
     res.json(order);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Record cash payment (partial/full) – agent/admin/owner/station_manager
+router.put('/:id/record-cash', protect, allowRoles('agent', 'admin', 'owner', 'station_manager'), async (req, res) => {
+  try {
+    const { amount } = req.body;
+    if (!amount || amount <= 0) {
+      return res.status(400).json({ error: 'Amount must be positive' });
+    }
+    const order = await Order.findById(req.params.id);
+    if (!order) return res.status(404).json({ error: 'Order not found' });
+
+    // Station manager validation
+    if (req.user.role === 'station_manager') {
+      const allowed = await canStationManageOrder(req.user._id, order);
+      if (!allowed) {
+        return res.status(403).json({ error: 'You can only manage pickup orders for your station' });
+      }
+    }
+
+    // Only allow if there is a remaining balance
+    if (!order.remainingBalance || order.remainingBalance <= 0) {
+      return res.status(400).json({ error: 'No remaining balance to collect' });
+    }
+    if (amount > order.remainingBalance) {
+      return res.status(400).json({ error: 'Amount exceeds remaining balance' });
+    }
+
+    order.cashCollected += amount;
+    order.remainingBalance -= amount;
+    if (order.remainingBalance === 0) {
+      order.paymentStatus = 'fully_paid';
+    }
+    await order.save();
+    res.json({ success: true, cashCollected: order.cashCollected, remainingBalance: order.remainingBalance, paymentStatus: order.paymentStatus });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }

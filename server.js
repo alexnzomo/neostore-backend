@@ -13,6 +13,10 @@ const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
 const compression = require('compression');
 const morgan = require('morgan');
 const sanitizeHtml = require('sanitize-html');
+const walletRoutes = require('./routes/wallet');
+app.use('/api/wallet', walletRoutes);
+const uploadRoutes = require('./routes/upload');
+app.use('/api/upload', uploadRoutes);
 
 const app = express();
 
