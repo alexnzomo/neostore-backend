@@ -14,7 +14,6 @@ const compression = require('compression');
 const morgan = require('morgan');
 const sanitizeHtml = require('sanitize-html');
 const walletRoutes = require('./routes/wallet');
-app.use('/api/wallet', walletRoutes);
 const uploadRoutes = require('./routes/upload');
 
 
@@ -36,8 +35,6 @@ const limiter = rateLimit({
   max: 100,
 });
 app.use('/api/', limiter);
-
-app.use('/api/upload', uploadRoutes);
 
 // Stripe webhook (needs raw body) - MUST be before express.json()
 app.post('/api/stripe/webhook', express.raw({type: 'application/json'}), async (req, res) => {
@@ -134,6 +131,8 @@ app.use('/api/reviews', reviewRoutes);
 app.use('/api/settings', settingsRoutes);
 app.use('/api/discounts', discountRoutes);
 app.use('/api/pickup/applications', pickupApplicationRoutes);
+app.use('/api/wallet', walletRoutes);      
+app.use('/api/upload', uploadRoutes);      
 
 // ---------- Auth middleware for payment endpoints ----------
 const { protect } = require('./middleware/auth');
