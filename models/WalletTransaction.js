@@ -25,7 +25,6 @@ const walletTransactionSchema = new mongoose.Schema({
 });
 
 walletTransactionSchema.index({ userId: 1, createdAt: -1 });
-walletTransactionSchema.index({ idempotencyKey: 1 }, { unique: true });
 walletTransactionSchema.index({ referenceId: 1, referenceType: 1 });
 
 module.exports = mongoose.model('WalletTransaction', walletTransactionSchema);
