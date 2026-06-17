@@ -19,6 +19,8 @@ const orderSchema = new mongoose.Schema({
   mpesaTransactionId: { type: String, default: null },
   mpesaFailureReason: { type: String, default: null },
   stripePaymentIntentId: { type: String, default: null },
+  cancellationReason: { type: String, default: null },
+  cancelledBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null },
   deliveryInfo: {
     type: { type: String, enum: ['delivery', 'pickup'], required: true },
     address: String,

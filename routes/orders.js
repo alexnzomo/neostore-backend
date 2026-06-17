@@ -5,28 +5,106 @@ const User = require('../models/User');
 const PickupStation = require('../models/PickupStation');
 const { protect } = require('../middleware/auth');
 const { allowRoles } = require('../middleware/roleCheck');
+const Settlement = require('../models/Settlement');
+const Category = require('../models/Category');
+const Settings = require('../models/Settings');
+const { cancelOrder } = require('../utils/orderUtils');
 
 const router = express.Router();
 
+// ========== Helpers ==========
+
 // Helper to check if a station manager is allowed to manage a given order
 async function canStationManageOrder(stationManagerId, order) {
-  // Only pickup orders can be managed by station managers
   if (order.deliveryInfo.type !== 'pickup') return false;
-  // Get the station manager's linked station ID
   const user = await User.findById(stationManagerId).select('stationId');
   if (!user || !user.stationId) return false;
-  // Find the station by its ID
   const station = await PickupStation.findById(user.stationId);
   if (!station) return false;
-  // Verify the order belongs to that station (by station name)
   return order.deliveryInfo.stationName === station.name;
 }
+
+// Helper to get a setting value
+async function getSetting(key) {
+  const setting = await Settings.findOne({ key });
+  return setting ? setting.value : null;
+}
+
+// Helper to create settlements for all vendors in an order
+async function createSettlementsForOrder(order) {
+  // Group order items by vendor
+  const vendorMap = {};
+  const categories = await Category.find();
+  for (const item of order.items) {
+    const product = await Product.findById(item.productId);
+    if (!product) continue;
+    const vendorId = product.vendorId.toString();
+    if (!vendorMap[vendorId]) {
+      vendorMap[vendorId] = {
+        vendorId: product.vendorId,
+        items: [],
+        subtotalUSD: 0,
+        totalCommissionUSD: 0
+      };
+    }
+    vendorMap[vendorId].items.push(item);
+    vendorMap[vendorId].subtotalUSD += item.priceUSD * item.quantity;
+    // Calculate commission for this item
+    const rate = product.commissionOverride !== null ? product.commissionOverride : (categories.find(c => c.name === product.category)?.commission || 5);
+    const commissionAmount = item.priceUSD * item.quantity * (rate / 100);
+    vendorMap[vendorId].totalCommissionUSD += commissionAmount;
+  }
+
+  // Fetch agent and station fees
+  const agentFee = await getSetting('agentDeliveryFee') || 0;
+  const stationFee = await getSetting('stationPickupFee') || 0;
+
+  const isPickup = order.deliveryInfo.type === 'pickup';
+  const agentEarnings = order.assignedAgentId ? agentFee : 0;
+  const stationEarnings = isPickup ? stationFee : 0;
+
+  // Create one settlement per vendor
+  const settlements = [];
+  for (const vendorId in vendorMap) {
+    const data = vendorMap[vendorId];
+    const vendorEarningsKES = (data.subtotalUSD - data.totalCommissionUSD) * 130;
+    const platformCommissionKES = data.totalCommissionUSD * 130;
+
+    // Check if settlement already exists (idempotent)
+    let settlement = await Settlement.findOne({
+      orderId: order._id,
+      vendorId: data.vendorId
+    });
+    if (settlement) {
+      // Optional: update existing settlement
+      continue;
+    }
+
+    settlement = new Settlement({
+      orderId: order._id,
+      vendorId: data.vendorId,
+      agentId: order.assignedAgentId,
+      stationId: isPickup ? order.deliveryInfo.stationId : null,
+      vendorEarnings: vendorEarningsKES,
+      agentEarnings: agentEarnings,
+      stationEarnings: stationEarnings,
+      platformCommission: platformCommissionKES,
+      vendorPaid: false,
+      agentPaid: false,
+      stationPaid: false
+    });
+    await settlement.save();
+    settlements.push(settlement);
+  }
+  return settlements;
+}
+
+// ========== Routes ==========
 
 // Get all orders (admin, owner, station_manager)
 router.get('/', protect, allowRoles('admin', 'owner', 'station_manager'), async (req, res) => {
   try {
     let query = {};
-    // If station_manager, only return pickup orders for their station
     if (req.user.role === 'station_manager') {
       const user = await User.findById(req.user._id).select('stationId');
       if (user && user.stationId) {
@@ -196,14 +274,14 @@ router.get('/:id', protect, async (req, res) => {
   }
 });
 
-// Update delivery status (agent/admin/owner/station_manager)
+// Update delivery status (agent/admin/owner/station_manager) – creates settlements on delivery + payment
 router.put('/:id/status', protect, allowRoles('agent', 'admin', 'owner', 'station_manager'), async (req, res) => {
   try {
     const { deliveryStatus } = req.body;
     const order = await Order.findById(req.params.id);
     if (!order) return res.status(404).json({ error: 'Order not found' });
 
-    // Extra validation for station managers
+    // Station manager validation
     if (req.user.role === 'station_manager') {
       const allowed = await canStationManageOrder(req.user._id, order);
       if (!allowed) {
@@ -214,7 +292,49 @@ router.put('/:id/status', protect, allowRoles('agent', 'admin', 'owner', 'statio
     order.deliveryStatus = deliveryStatus;
     order.updatedAt = Date.now();
     await order.save();
+
+    // If order is delivered and payment is complete, create settlements
+    if (deliveryStatus === 'delivered' && (order.paymentStatus === 'fully_paid' || order.paymentStatus === 'cash_collected')) {
+      await createSettlementsForOrder(order);
+    }
+
     res.json(order);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Refund an order (admin/owner)
+router.post('/:id/refund', protect, allowRoles('admin', 'owner'), async (req, res) => {
+  try {
+    const order = await Order.findById(req.params.id);
+    if (!order) return res.status(404).json({ error: 'Order not found' });
+    if (order.paymentStatus === 'refunded') return res.status(400).json({ error: 'Already refunded' });
+    if (!['fully_paid', 'cash_collected', 'deposit_paid'].includes(order.paymentStatus)) {
+      return res.status(400).json({ error: 'Order not eligible for refund' });
+    }
+
+    // Reverse stock
+    for (const item of order.items) {
+      await Product.updateOne({ _id: item.productId }, { $inc: { stock: item.quantity } });
+    }
+
+    // Refund logic for online payments (Stripe/M-Pesa) would go here – for now we just mark refunded
+    // In production, you would call Stripe refund API or M-Pesa reversal.
+
+    order.paymentStatus = 'refunded';
+    order.deliveryStatus = 'cancelled';
+    await order.save();
+
+    // Reverse settlement if exists
+    const settlement = await Settlement.findOne({ orderId: order._id });
+    if (settlement) {
+      // Optionally reverse settlement (or mark as reversed)
+      // For simplicity, we can delete or mark reversed
+      await Settlement.deleteOne({ _id: settlement._id });
+    }
+
+    res.json({ success: true, order });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -240,6 +360,12 @@ router.put('/:id/confirm-cash', protect, allowRoles('agent', 'admin', 'owner', '
     order.paymentStatus = 'cash_collected';
     order.updatedAt = Date.now();
     await order.save();
+
+    // If order is delivered and payment is complete, create settlements
+    if (order.deliveryStatus === 'delivered' && (order.paymentStatus === 'fully_paid' || order.paymentStatus === 'cash_collected')) {
+      await createSettlementsForOrder(order);
+    }
+
     res.json(order);
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -278,10 +404,42 @@ router.put('/:id/record-cash', protect, allowRoles('agent', 'admin', 'owner', 's
       order.paymentStatus = 'fully_paid';
     }
     await order.save();
+
+    // If order is delivered and payment is complete, create settlements
+    if (order.deliveryStatus === 'delivered' && (order.paymentStatus === 'fully_paid' || order.paymentStatus === 'cash_collected')) {
+      await createSettlementsForOrder(order);
+    }
+
     res.json({ success: true, cashCollected: order.cashCollected, remainingBalance: order.remainingBalance, paymentStatus: order.paymentStatus });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
+
+// Cancel order (customer, admin, owner)
+router.put('/:id/cancel', protect, async (req, res) => {
+  try {
+    const order = await Order.findById(req.params.id);
+    if (!order) return res.status(404).json({ error: 'Order not found' });
+
+    // Check permissions
+    const isAdmin = ['admin', 'owner'].includes(req.user.role);
+    if (!isAdmin && order.customerId.toString() !== req.user._id.toString()) {
+      return res.status(403).json({ error: 'Not authorized to cancel this order' });
+    }
+
+    const { reason } = req.body;
+    const cancelledOrder = await cancelOrder(
+      order._id,
+      reason || 'Order cancelled',
+      req.user._id
+    );
+    res.json({ success: true, order: cancelledOrder });
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+module.exports = router;
 
 module.exports = router;

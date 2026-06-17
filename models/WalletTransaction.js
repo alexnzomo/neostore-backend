@@ -12,7 +12,8 @@ const walletTransactionSchema = new mongoose.Schema({
   balanceAfter: { type: Number, required: true },
   description: { type: String, required: true },
   referenceId: { type: String },
-  referenceType: { type: String, enum: ['order', 'topup', 'transfer', 'refund'] },
+  // ✅ Updated: added 'settlement' and 'withdrawal'
+  referenceType: { type: String, enum: ['order', 'topup', 'transfer', 'refund', 'settlement', 'withdrawal'] },
   pairTransactionId: { type: mongoose.Schema.Types.ObjectId, ref: 'WalletTransaction' },
   metadata: { type: mongoose.Schema.Types.Mixed, default: {} },
   status: {
@@ -25,6 +26,7 @@ const walletTransactionSchema = new mongoose.Schema({
 });
 
 walletTransactionSchema.index({ userId: 1, createdAt: -1 });
+walletTransactionSchema.index({ idempotencyKey: 1 }, { unique: true });
 walletTransactionSchema.index({ referenceId: 1, referenceType: 1 });
 
 module.exports = mongoose.model('WalletTransaction', walletTransactionSchema);
