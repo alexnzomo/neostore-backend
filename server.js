@@ -58,7 +58,8 @@ app.use(morgan('combined'));
 // Global rate limit
 const limiter = rateLimit({
   windowMs: 15 * 60 * 1000,
-  max: 100,
+  max: 200,
+  skip: (req) => req.path.startsWith('/api/notifications'), // skip notifications
   handler: (req, res) => {
     res.status(429).json({ error: 'Too many requests, please try again later.' });
   }
