@@ -190,13 +190,13 @@ app.post('/api/create-payment-intent', protect, async (req, res) => {
       amount: Math.round(amount),
       currency: currency || 'kes',
       payment_method: paymentMethodId,
-      confirmation_method: 'manual', // frontend will confirm
-      confirm: false,                // do not confirm here
+      confirm: false,                // do not confirm here – frontend will confirm
       metadata: { orderId: orderId || 'unknown' },
       automatic_payment_methods: {
         enabled: true,
-        allow_redirects: 'never'    // prevent redirects – we will handle them manually
+        allow_redirects: 'never'    // frontend handles redirect via confirmCardPayment
       }
+      // Do NOT include confirmation_method – it conflicts with automatic_payment_methods
     });
     res.json({ success: true, clientSecret: paymentIntent.client_secret, paymentIntentId: paymentIntent.id });
   } catch (error) {
