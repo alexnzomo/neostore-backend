@@ -12,6 +12,8 @@ cloudinary.config({
   api_secret: process.env.CLOUDINARY_API_SECRET
 });
 
+console.log('🔧 Cloudinary configured with cloud_name:', process.env.CLOUDINARY_CLOUD_NAME);
+
 // Configure Multer storage with Cloudinary
 const storage = new CloudinaryStorage({
   cloudinary: cloudinary,
@@ -29,18 +31,25 @@ const upload = multer({
 
 const router = express.Router();
 
-// Upload endpoint (admin/owner/vendor)
-router.post('/', protect, allowRoles('admin', 'owner', 'vendor'), upload.single('image'), async (req, res) => {
+// Upload endpoint (admin/owner/vendor) – but we also allow for KYC
+router.post('/', protect, upload.single('image'), async (req, res) => {
+  console.log('📸 Upload request received');
+  console.log('📸 req.file:', req.file);
+  console.log('📸 req.body:', req.body);
+  console.log('📸 Content-Type:', req.headers['content-type']);
+
   try {
     if (!req.file) {
-      return res.status(400).json({ error: 'No file uploaded' });
+      console.error('❌ No file received. Check that the field name is "image".');
+      return res.status(400).json({ error: 'No file uploaded. Field name must be "image".' });
     }
     // Cloudinary returns the URL in req.file.path or req.file.secure_url
-    const imageUrl = req.file.path; // or req.file.secure_url
+    const imageUrl = req.file.path || req.file.secure_url;
+    console.log('✅ File uploaded successfully:', imageUrl);
     res.json({ success: true, imageUrl });
   } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: err.message });
+    console.error('❌ Upload error:', err);
+    res.status(500).json({ error: 'Upload failed: ' + err.message });
   }
 });
 
