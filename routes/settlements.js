@@ -118,6 +118,14 @@ router.put('/:id/paid', protect, allowRoles('admin', 'owner'), async (req, res) 
       'settlement'
     );
 
+    await createNotification(
+      userId,
+      'settlement',
+      'Payout received',
+      `You received KES ${amount} from settlement for order #${settlement.orderId}`,
+      '/account.html'
+    );
+
     // If all parties are paid, set paidAt
     if (settlement.vendorPaid && settlement.agentPaid && settlement.stationPaid) {
       settlement.paidAt = new Date();

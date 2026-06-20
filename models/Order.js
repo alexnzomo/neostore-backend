@@ -1,4 +1,5 @@
 const mongoose = require('mongoose');
+const Counter = require('./Counter');
 
 const orderItemSchema = new mongoose.Schema({
   productId: { type: mongoose.Schema.Types.ObjectId, ref: 'Product', required: true },
@@ -8,19 +9,27 @@ const orderItemSchema = new mongoose.Schema({
 });
 
 const orderSchema = new mongoose.Schema({
-  orderId: { type: String, unique: true }, // e.g., ORD1001
+  orderId: { type: String, unique: true },
   customerId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
   customerName: { type: String, required: true },
   customerEmail: { type: String, required: true },
   customerPhone: { type: String, required: true },
-  // Add these fields to your orderSchema
+  idempotencyKey: { type: String, unique: true, sparse: true },
+  
   mpesaMerchantRequestId: { type: String, default: null },
   mpesaCheckoutRequestId: { type: String, default: null },
   mpesaTransactionId: { type: String, default: null },
   mpesaFailureReason: { type: String, default: null },
   stripePaymentIntentId: { type: String, default: null },
+  
   cancellationReason: { type: String, default: null },
   cancelledBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null },
+  
+  // Refund audit fields
+  refundReason: { type: String, default: null },
+  refundedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null },
+  refundedAt: { type: Date, default: null },
+  
   deliveryInfo: {
     type: { type: String, enum: ['delivery', 'pickup'], required: true },
     address: String,
@@ -41,20 +50,19 @@ const orderSchema = new mongoose.Schema({
   depositPaid: { type: Number, default: 0, min: 0 },
   balanceDue: { type: Number, default: 0, min: 0 },
   cashCollected: { type: Number, default: 0, min: 0 },
-  remainingBalance: { type: Number, default: 0, min: 0 },  
+  remainingBalance: { type: Number, default: 0, min: 0 },
   assignedAgentId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null },
   createdAt: { type: Date, default: Date.now },
   updatedAt: { type: Date, default: Date.now }
 });
 
 orderSchema.statics.getNextOrderId = async function() {
-  const lastOrder = await this.findOne().sort({ orderId: -1 });
-  let nextNum = 1001;
-  if (lastOrder && lastOrder.orderId) {
-    const match = lastOrder.orderId.match(/\d+/);
-    if (match) nextNum = parseInt(match[0]) + 1;
-  }
-  return `ORD${nextNum}`;
+  const counter = await Counter.findOneAndUpdate(
+    { _id: 'orderId' },
+    { $inc: { seq: 1 } },
+    { new: true, upsert: true }
+  );
+  return `ORD${counter.seq}`;
 };
 
 module.exports = mongoose.model('Order', orderSchema);

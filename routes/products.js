@@ -15,7 +15,7 @@ const router = express.Router();
 // ========== Helper: Get sponsorship fee per day ==========
 async function getSponsorshipFeePerDay() {
   const setting = await Settings.findOne({ key: 'sponsorshipFeePerDay' });
-  return setting ? setting.value : 500; // default 500 KES
+  return setting ? setting.value : 130; // default 130 KES ($1/day)
 }
 
 // ========== Helper: Initiate M‑Pesa STK push ==========
@@ -211,6 +211,11 @@ router.post('/:id/sponsor', protect, async (req, res) => {
   try {
     const { days, paymentMethod, phoneNumber } = req.body;
     if (!days || days <= 0) return res.status(400).json({ error: 'Invalid number of days' });
+
+    // 🔴 NEW: Enforce minimum 4 days sponsorship
+    if (days < 4) {
+      return res.status(400).json({ error: 'Minimum sponsorship is 4 days' });
+    }
 
     const product = await Product.findById(req.params.id);
     if (!product) return res.status(404).json({ error: 'Product not found' });

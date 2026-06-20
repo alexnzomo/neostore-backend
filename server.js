@@ -20,6 +20,7 @@ const User = require('./models/User');
 const Order = require('./models/Order');
 const Product = require('./models/Product');
 const SponsorshipRequest = require('./models/SponsorshipRequest');
+const notificationRoutes = require('./routes/notifications');
 
 // ========== Utils ==========
 const { cancelOrder } = require('./utils/orderUtils');
@@ -58,6 +59,9 @@ app.use(morgan('combined'));
 const limiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 100,
+  handler: (req, res) => {
+    res.status(429).json({ error: 'Too many requests, please try again later.' });
+  }
 });
 app.use('/api/', limiter);
 
@@ -167,6 +171,7 @@ app.use('/api/upload', uploadRoutes);
 app.use('/api/settlements', settlementRoutes);
 app.use('/api/withdrawals', withdrawalRoutes);
 app.use('/api/kyc', kycRoutes);
+app.use('/api/notifications', notificationRoutes);
 
 // ---------- Auth middleware for payment endpoints ----------
 const { protect } = require('./middleware/auth');
@@ -184,11 +189,15 @@ app.post('/api/create-payment-intent', protect, async (req, res) => {
       amount: Math.round(amount),
       currency: currency || 'kes',
       payment_method: paymentMethodId,
-      confirmation_method: 'manual',
-      confirm: true,
-      metadata: { orderId: orderId || 'unknown' }
+      confirmation_method: 'manual', // frontend will confirm
+      confirm: false,                // do not confirm here
+      metadata: { orderId: orderId || 'unknown' },
+      automatic_payment_methods: {
+        enabled: true,
+        allow_redirects: 'never'    // prevent redirects – we will handle them manually
+      }
     });
-    res.json({ success: true, paymentIntent });
+    res.json({ success: true, clientSecret: paymentIntent.client_secret, paymentIntentId: paymentIntent.id });
   } catch (error) {
     console.error('Stripe error:', error);
     res.status(500).json({ error: error.message });

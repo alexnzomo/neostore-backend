@@ -8,7 +8,8 @@ const { allowRoles } = require('../middleware/roleCheck');
 const Settlement = require('../models/Settlement');
 const Category = require('../models/Category');
 const Settings = require('../models/Settings');
-const { cancelOrder } = require('../utils/orderUtils');
+const Notification = require('../models/Notification');
+const { cancelOrder, processRefund } = require('../utils/orderUtils');
 
 const router = express.Router();
 
@@ -134,7 +135,8 @@ router.post('/', protect, async (req, res) => {
       paymentMethod,
       depositPercentage,
       discountCode,
-      discountAmountKES
+      discountAmountKES,
+      idempotencyKey
     } = req.body;
 
     // Validate discount and deposit values
@@ -152,6 +154,17 @@ router.post('/', protect, async (req, res) => {
     for (const item of items) {
       if (!item.productId || !item.quantity || item.quantity <= 0) {
         return res.status(400).json({ error: 'Each item must have a valid product ID and positive quantity' });
+      }
+    }
+
+    // Idempotency check
+    if (idempotencyKey) {
+      const existingOrder = await Order.findOne({
+        customerId: req.user._id,
+        idempotencyKey
+      });
+      if (existingOrder) {
+        return res.status(409).json({ error: 'Duplicate order attempt' });
       }
     }
 
@@ -224,7 +237,8 @@ router.post('/', protect, async (req, res) => {
       balanceDue,
       assignedAgentId: null,
       cashCollected: 0,
-      remainingBalance: balanceDue
+      remainingBalance: balanceDue,
+      idempotencyKey: idempotencyKey || null
     });
 
     // Deduct stock
@@ -258,6 +272,23 @@ router.put('/:id/assign-agent', protect, allowRoles('admin', 'owner'), async (re
   order.assignedAgentId = agentId || null;
   await order.save();
   res.json(order);
+});
+
+// Assign station to order (admin/owner only)
+router.put('/:id/assign-station', protect, allowRoles('admin', 'owner'), async (req, res) => {
+  try {
+    const { stationId } = req.body;
+    const order = await Order.findById(req.params.id);
+    if (!order) return res.status(404).json({ error: 'Order not found' });
+    const station = await PickupStation.findById(stationId);
+    if (!station) return res.status(404).json({ error: 'Station not found' });
+    order.deliveryInfo.stationId = stationId;
+    order.deliveryInfo.stationName = station.name;
+    await order.save();
+    res.json(order);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // Get single order
@@ -304,9 +335,10 @@ router.put('/:id/status', protect, allowRoles('agent', 'admin', 'owner', 'statio
   }
 });
 
-// Refund an order (admin/owner)
+// Refund an order (admin/owner only)
 router.post('/:id/refund', protect, allowRoles('admin', 'owner'), async (req, res) => {
   try {
+    const { reason } = req.body;
     const order = await Order.findById(req.params.id);
     if (!order) return res.status(404).json({ error: 'Order not found' });
     if (order.paymentStatus === 'refunded') return res.status(400).json({ error: 'Already refunded' });
@@ -314,28 +346,46 @@ router.post('/:id/refund', protect, allowRoles('admin', 'owner'), async (req, re
       return res.status(400).json({ error: 'Order not eligible for refund' });
     }
 
+    // Time limit: only allow refunds within 30 days (configurable)
+    const REFUND_DAYS_LIMIT = parseInt(process.env.REFUND_DAYS_LIMIT) || 30;
+    const now = new Date();
+    const orderDate = new Date(order.createdAt);
+    const daysDiff = (now - orderDate) / (1000 * 60 * 60 * 24);
+    if (daysDiff > REFUND_DAYS_LIMIT) {
+      return res.status(400).json({ error: `Refund only allowed within ${REFUND_DAYS_LIMIT} days of order creation` });
+    }
+
     // Reverse stock
     for (const item of order.items) {
       await Product.updateOne({ _id: item.productId }, { $inc: { stock: item.quantity } });
     }
 
-    // Refund logic for online payments (Stripe/M-Pesa) would go here – for now we just mark refunded
-    // In production, you would call Stripe refund API or M-Pesa reversal.
+    // Process the actual refund (Stripe, wallet, M-Pesa)
+    await processRefund(order);
 
+    // Update order
     order.paymentStatus = 'refunded';
     order.deliveryStatus = 'cancelled';
+    order.refundReason = reason || 'Refund requested by admin';
+    order.refundedBy = req.user._id;
+    order.refundedAt = new Date();
     await order.save();
 
-    // Reverse settlement if exists
-    const settlement = await Settlement.findOne({ orderId: order._id });
-    if (settlement) {
-      // Optionally reverse settlement (or mark as reversed)
-      // For simplicity, we can delete or mark reversed
-      await Settlement.deleteOne({ _id: settlement._id });
-    }
+    // Remove settlement
+    await Settlement.deleteMany({ orderId: order._id });
+
+    // Notify customer
+    await Notification.create({
+      userId: order.customerId,
+      type: 'system',
+      title: 'Refund processed',
+      message: `Your order #${order.orderId} has been refunded. Reason: ${order.refundReason}`,
+      link: `/account.html`
+    });
 
     res.json({ success: true, order });
   } catch (err) {
+    console.error('Refund error:', err);
     res.status(500).json({ error: err.message });
   }
 });
@@ -440,6 +490,17 @@ router.put('/:id/cancel', protect, async (req, res) => {
   }
 });
 
-module.exports = router;
+// Mark order as fully paid (admin/owner)
+router.put('/:id/mark-paid', protect, allowRoles('admin', 'owner'), async (req, res) => {
+  try {
+    const order = await Order.findById(req.params.id);
+    if (!order) return res.status(404).json({ error: 'Order not found' });
+    order.paymentStatus = 'fully_paid';
+    await order.save();
+    res.json({ success: true, order });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
 
 module.exports = router;
