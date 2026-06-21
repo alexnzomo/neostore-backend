@@ -393,6 +393,17 @@ cron.schedule('0 0 * * *', async () => {
   }
 });
 
+// TEMPORARY – Test Cloudinary connectivity on Render
+app.get('/api/test-cloudinary', async (req, res) => {
+  const cloudinary = require('cloudinary').v2;
+  try {
+    const result = await cloudinary.api.ping();
+    res.json({ success: true, result });
+  } catch (err) {
+    res.status(500).json({ error: err.message, stack: err.stack });
+  }
+});
+
 // ---------- Start server ----------
 const PORT = process.env.PORT || 5000;
 app.listen(PORT, async () => {
