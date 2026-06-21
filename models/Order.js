@@ -46,7 +46,7 @@ const orderSchema = new mongoose.Schema({
   totalKES: { type: Number, required: true, min: 0 },
   paymentStatus: { type: String, enum: ['pending', 'deposit_paid', 'fully_paid', 'cash_collected', 'refunded'], default: 'pending' },
   deliveryStatus: { type: String, enum: ['pending', 'processing', 'shipped', 'out_for_delivery', 'delivered', 'cancelled'], default: 'pending' },
-  paymentMethod: { type: String, enum: ['card', 'mpesa', 'cash_on_delivery', 'card_deposit', 'mpesa_deposit'], required: true },
+  paymentMethod: { type: String, enum: ['card', 'mpesa', 'cash_on_delivery', 'card_deposit', 'mpesa_deposit', 'wallet'], required: true },
   depositPaid: { type: Number, default: 0, min: 0 },
   balanceDue: { type: Number, default: 0, min: 0 },
   cashCollected: { type: Number, default: 0, min: 0 },

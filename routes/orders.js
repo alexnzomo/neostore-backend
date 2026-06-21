@@ -20,7 +20,6 @@ async function canStationManageOrder(stationManagerId, order) {
   if (order.deliveryInfo.type !== 'pickup') return false;
   const user = await User.findById(stationManagerId).select('stationId');
   if (!user || !user.stationId) return false;
-  // Compare stationId directly
   return order.deliveryInfo.stationId && order.deliveryInfo.stationId.toString() === user.stationId.toString();
 }
 
@@ -32,7 +31,6 @@ async function getSetting(key) {
 
 // Helper to create settlements for all vendors in an order
 async function createSettlementsForOrder(order) {
-  // Group order items by vendor
   const vendorMap = {};
   const categories = await Category.find();
   for (const item of order.items) {
@@ -108,7 +106,6 @@ router.get('/', protect, allowRoles('admin', 'owner', 'station_manager'), async 
     if (req.user.role === 'station_manager') {
       const user = await User.findById(req.user._id).select('stationId');
       if (user && user.stationId) {
-        // Use stationId instead of stationName
         query = { 'deliveryInfo.type': 'pickup', 'deliveryInfo.stationId': user.stationId };
       } else {
         return res.json([]);
@@ -163,6 +160,16 @@ router.post('/', protect, async (req, res) => {
       }
     }
 
+    // Ensure stationId for pickup orders
+    if (deliveryInfo.type === 'pickup' && deliveryInfo.stationName) {
+      const station = await PickupStation.findOne({ name: deliveryInfo.stationName });
+      if (station) {
+        deliveryInfo.stationId = station._id;
+      } else {
+        return res.status(400).json({ error: 'Pickup station not found' });
+      }
+    }
+
     // Validate stock and calculate totals
     let subtotalUSD = 0;
     let shippingFeeKES = 0;
@@ -188,18 +195,20 @@ router.post('/', protect, async (req, res) => {
       });
     }
 
-    const subtotalKES = subtotalUSD * 130; // fixed rate, can be dynamic later
+    const subtotalKES = subtotalUSD * 130;
     let totalKES = subtotalKES - (discountAmountKES || 0) + shippingFeeKES;
     if (totalKES < 0) totalKES = 0;
 
     let depositPaid = 0;
     let balanceDue = 0;
     let paymentStatus = 'pending';
-    if (paymentMethod === 'card_deposit' || paymentMethod === 'mpesa_deposit') {
+
+    // === Payment method logic (all cases) ===
+    if (paymentMethod === 'card_deposit' || paymentMethod === 'mpesa_deposit' || paymentMethod === 'wallet_deposit') {
       depositPaid = totalKES * (depositPercentage / 100);
       balanceDue = totalKES - depositPaid;
       paymentStatus = 'deposit_paid';
-    } else if (paymentMethod === 'card' || paymentMethod === 'mpesa') {
+    } else if (paymentMethod === 'card' || paymentMethod === 'mpesa' || paymentMethod === 'wallet') {
       depositPaid = totalKES;
       balanceDue = 0;
       paymentStatus = 'fully_paid';
@@ -485,12 +494,13 @@ router.put('/:id/cancel', protect, async (req, res) => {
   }
 });
 
-// Mark order as fully paid (admin/owner)
-router.put('/:id/mark-paid', protect, allowRoles('admin', 'owner'), async (req, res) => {
+// Mark order as fully paid (owner only – bypasses payment)
+router.put('/:id/mark-paid', protect, allowRoles('owner'), async (req, res) => {
   try {
     const order = await Order.findById(req.params.id);
     if (!order) return res.status(404).json({ error: 'Order not found' });
     order.paymentStatus = 'fully_paid';
+    order.updatedAt = Date.now();
     await order.save();
     res.json({ success: true, order });
   } catch (err) {
