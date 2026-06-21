@@ -178,16 +178,14 @@ app.use('/api/notifications', notificationRoutes);
 const { protect } = require('./middleware/auth');
 
 // ========== Payment endpoints ==========
-// Stripe Payment Intent (frontend confirms, no redirects)
+// Stripe Payment Intent (frontend confirms via confirmCardPayment)
 app.post('/api/create-payment-intent', protect, async (req, res) => {
   const { amount, currency, paymentMethodId, orderId } = req.body;
-  
+
   // Validate required fields
   if (!amount || !paymentMethodId) {
     return res.status(400).json({ error: 'Missing amount or payment method' });
   }
-
-  // Validate amount is positive
   if (amount <= 0) {
     return res.status(400).json({ error: 'Amount must be greater than 0' });
   }
@@ -196,7 +194,6 @@ app.post('/api/create-payment-intent', protect, async (req, res) => {
   // For KES, 1 KES = 100 cents
   let amountInCents;
   if (currency === 'kes' || currency === 'KES') {
-    // Ensure we don't have floating-point errors
     amountInCents = Math.round(amount * 100);
     // Stripe minimum for KES is 50 KES = 5000 cents
     if (amountInCents < 5000) {
@@ -213,13 +210,13 @@ app.post('/api/create-payment-intent', protect, async (req, res) => {
       amount: amountInCents,                      // in cents
       currency: currency || 'kes',
       payment_method: paymentMethodId,
-      confirmation_method: 'manual',              // frontend will confirm
-      confirm: false,                             // do not confirm here
+      confirm: false,                             // frontend will confirm
       metadata: { orderId: orderId || 'unknown' },
       automatic_payment_methods: {
         enabled: true,
         allow_redirects: 'never'                  // handle redirects via frontend confirmCardPayment
       }
+      // Do NOT set confirmation_method – it conflicts with automatic_payment_methods
     });
 
     // Return client secret to frontend
@@ -233,6 +230,7 @@ app.post('/api/create-payment-intent', protect, async (req, res) => {
     res.status(500).json({ error: error.message });
   }
 });
+
 // ---------- M-Pesa Configuration ----------
 const CONSUMER_KEY = process.env.CONSUMER_KEY;
 const CONSUMER_SECRET = process.env.CONSUMER_SECRET;
