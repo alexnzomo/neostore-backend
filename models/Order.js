@@ -25,7 +25,6 @@ const orderSchema = new mongoose.Schema({
   cancellationReason: { type: String, default: null },
   cancelledBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null },
   
-  // Refund audit fields
   refundReason: { type: String, default: null },
   refundedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null },
   refundedAt: { type: Date, default: null },
@@ -35,6 +34,7 @@ const orderSchema = new mongoose.Schema({
     address: String,
     city: String,
     county: String,
+    landmark: { type: String, default: null }, // ✅ added landmark (optional)
     stationId: { type: mongoose.Schema.Types.ObjectId, ref: 'PickupStation' },
     stationName: String
   },
@@ -46,7 +46,12 @@ const orderSchema = new mongoose.Schema({
   totalKES: { type: Number, required: true, min: 0 },
   paymentStatus: { type: String, enum: ['pending', 'deposit_paid', 'fully_paid', 'cash_collected', 'refunded'], default: 'pending' },
   deliveryStatus: { type: String, enum: ['pending', 'processing', 'shipped', 'out_for_delivery', 'delivered', 'cancelled'], default: 'pending' },
-  paymentMethod: { type: String, enum: ['card', 'mpesa', 'cash_on_delivery', 'card_deposit', 'mpesa_deposit', 'wallet'], required: true },
+  paymentMethod: { 
+    type: String, 
+    // ✅ Added 'wallet' and 'wallet_deposit'
+    enum: ['card', 'mpesa', 'cash_on_delivery', 'card_deposit', 'mpesa_deposit', 'wallet', 'wallet_deposit'],
+    required: true 
+  },
   depositPaid: { type: Number, default: 0, min: 0 },
   balanceDue: { type: Number, default: 0, min: 0 },
   cashCollected: { type: Number, default: 0, min: 0 },

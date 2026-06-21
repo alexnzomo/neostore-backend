@@ -71,7 +71,7 @@ router.put('/sponsorship-fee', protect, allowRoles('admin', 'owner'), async (req
   res.json({ success: true, fee });
 });
 
-// ========== Agent Delivery Fee (NEW) ==========
+// ========== Agent Delivery Fee ==========
 router.get('/agent-delivery-fee', async (req, res) => {
   const value = await getSetting('agentDeliveryFee') || 0;
   res.json({ value });
@@ -90,7 +90,7 @@ router.put('/agent-delivery-fee', protect, allowRoles('admin', 'owner'), async (
   res.json({ success: true, value: fee });
 });
 
-// ========== Station Pickup Fee (NEW) ==========
+// ========== Station Pickup Fee ==========
 router.get('/station-pickup-fee', async (req, res) => {
   const value = await getSetting('stationPickupFee') || 0;
   res.json({ value });
@@ -109,18 +109,7 @@ router.put('/station-pickup-fee', protect, allowRoles('admin', 'owner'), async (
   res.json({ success: true, value: fee });
 });
 
-// ========== Generic setting getter (for other routes) ==========
-router.get('/:key', async (req, res) => {
-  try {
-    const { key } = req.params;
-    const value = await getSetting(key);
-    res.json({ key, value: value || 0 });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// ========== Stripe Publishable Key ==========
+// ========== Stripe Publishable Key (MOVED ABOVE GENERIC ROUTE) ==========
 router.get('/stripe-publishable-key', async (req, res) => {
   try {
     const key = process.env.STRIPE_PUBLISHABLE_KEY;
@@ -128,6 +117,17 @@ router.get('/stripe-publishable-key', async (req, res) => {
       return res.status(500).json({ error: 'Stripe publishable key not configured' });
     }
     res.json({ key });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ========== Generic setting getter (KEEP LAST – catches all other keys) ==========
+router.get('/:key', async (req, res) => {
+  try {
+    const { key } = req.params;
+    const value = await getSetting(key);
+    res.json({ key, value: value || 0 });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
