@@ -14,7 +14,7 @@ const { requireKYC } = require('../middleware/kyc');
 const otpStore = new Map();
 
 // Helper to send email (import from server.js or use a shared utility)
-const { sendEmail } = require('../utils/email'); // Assume you have a utils/email.js
+const { sendEmail } = require('../utils/email');
 
 const router = express.Router();
 
@@ -74,15 +74,37 @@ router.get('/transactions/:id', protect, async (req, res) => {
   }
 });
 
+// ========== FIXED: Get transactions for a specific user (admin/owner only) ==========
 router.get('/transactions/:userId', protect, allowRoles('admin', 'owner'), async (req, res) => {
   try {
     const { userId } = req.params;
-    const limit = parseInt(req.query.limit) || 50;
+    
+    // Check if user exists
+    const user = await User.findById(userId);
+    if (!user) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+    
+    const limit = parseInt(req.query.limit) || 100;
     const skip = parseInt(req.query.skip) || 0;
-    const result = await WalletService.getTransactionHistory(userId, limit, skip);
-    res.json(result.transactions);
+    
+    const transactions = await WalletTransaction.find({ userId })
+      .sort({ createdAt: -1 })
+      .skip(skip)
+      .limit(limit);
+    
+    const total = await WalletTransaction.countDocuments({ userId });
+    
+    res.json({ 
+      transactions, 
+      total, 
+      limit, 
+      skip,
+      user: { id: user._id, fullName: user.fullName, email: user.email }
+    });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    console.error('Error fetching user transactions:', err);
+    res.status(500).json({ error: 'Failed to load transactions: ' + err.message });
   }
 });
 
@@ -177,7 +199,6 @@ router.post('/transfer', protect, requireKYC, verifyTempToken, [
         '/account.html'
       );
     }
-    // ===== END NOTIFICATIONS =====
 
     res.json({
       success: true,
@@ -192,29 +213,6 @@ router.post('/transfer', protect, requireKYC, verifyTempToken, [
 
 // ========== PIN Management ==========
 
-// Existing PIN set (without OTP – kept for backward compatibility, but we can deprecate)
-router.post('/pin/set', protect, [
-  body('pin').isLength({ min: 4, max: 6 }).withMessage('PIN must be 4-6 digits')
-], async (req, res) => {
-  const errors = validationResult(req);
-  if (!errors.isEmpty()) return res.status(400).json({ errors: errors.array() });
-
-  try {
-    const { pin } = req.body;
-    const userId = req.user._id;
-    const pinHash = await bcrypt.hash(pin, 10);
-    
-    await WalletPIN.findOneAndUpdate(
-      { userId },
-      { userId, pinHash, failedAttempts: 0, lockedUntil: null },
-      { upsert: true, new: true }
-    );
-    res.json({ success: true, message: 'PIN set successfully' });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
 // Request OTP for PIN change
 router.post('/pin/request-otp', protect, async (req, res) => {
   try {
@@ -225,7 +223,6 @@ router.post('/pin/request-otp', protect, async (req, res) => {
     const otp = Math.floor(100000 + Math.random() * 900000).toString();
     const expiresAt = Date.now() + 5 * 60 * 1000; // 5 minutes
 
-    // Store OTP in memory (could also store in DB or Redis)
     otpStore.set(userId.toString(), { otp, expiresAt });
 
     // Send email
@@ -274,7 +271,6 @@ router.post('/pin/verify-otp', protect, [
       { upsert: true, new: true }
     );
 
-    // Clear OTP
     otpStore.delete(userId.toString());
 
     res.json({ success: true, message: 'PIN set successfully.' });

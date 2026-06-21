@@ -20,9 +20,8 @@ async function canStationManageOrder(stationManagerId, order) {
   if (order.deliveryInfo.type !== 'pickup') return false;
   const user = await User.findById(stationManagerId).select('stationId');
   if (!user || !user.stationId) return false;
-  const station = await PickupStation.findById(user.stationId);
-  if (!station) return false;
-  return order.deliveryInfo.stationName === station.name;
+  // Compare stationId directly
+  return order.deliveryInfo.stationId && order.deliveryInfo.stationId.toString() === user.stationId.toString();
 }
 
 // Helper to get a setting value
@@ -109,12 +108,8 @@ router.get('/', protect, allowRoles('admin', 'owner', 'station_manager'), async 
     if (req.user.role === 'station_manager') {
       const user = await User.findById(req.user._id).select('stationId');
       if (user && user.stationId) {
-        const station = await PickupStation.findById(user.stationId);
-        if (station) {
-          query = { 'deliveryInfo.type': 'pickup', 'deliveryInfo.stationName': station.name };
-        } else {
-          return res.json([]);
-        }
+        // Use stationId instead of stationName
+        query = { 'deliveryInfo.type': 'pickup', 'deliveryInfo.stationId': user.stationId };
       } else {
         return res.json([]);
       }

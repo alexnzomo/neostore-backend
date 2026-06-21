@@ -1,5 +1,6 @@
 const express = require('express');
 const KYC = require('../models/KYC');
+const Notification = require('../models/Notification');
 const { protect } = require('../middleware/auth');
 const { allowRoles } = require('../middleware/roleCheck');
 const { body, validationResult } = require('express-validator');
@@ -140,8 +141,17 @@ router.put('/:id', protect, allowRoles('admin', 'owner'), async (req, res) => {
     kyc.reviewedAt = new Date();
     await kyc.save();
 
-    // Optionally create a notification for the user
-    // (you can add this later)
+    // ========== CREATE NOTIFICATION FOR USER ==========
+    const isVerified = status === 'verified';
+    await Notification.create({
+      userId: kyc.userId,
+      type: 'system',
+      title: isVerified ? '✅ KYC Approved' : '❌ KYC Rejected',
+      message: isVerified 
+        ? 'Your KYC verification has been approved. You can now use all wallet features.'
+        : `Your KYC verification was rejected. Reason: ${adminNote || 'Please re-submit with correct documents.'}`,
+      link: '/account.html'
+    });
 
     console.log(`✅ KYC ${status} for user ${kyc.userId} by admin ${req.user._id}`);
     res.json({ success: true, kyc });

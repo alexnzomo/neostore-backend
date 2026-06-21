@@ -5,6 +5,12 @@ const { allowRoles } = require('../middleware/roleCheck');
 
 const router = express.Router();
 
+// ========== Helper ==========
+async function getSetting(key) {
+  const setting = await Settings.findOne({ key });
+  return setting ? setting.value : null;
+}
+
 // ========== Global Commission ==========
 router.get('/global-commission', async (req, res) => {
   let setting = await Settings.findOne({ key: 'global_commission' });
@@ -63,6 +69,55 @@ router.put('/sponsorship-fee', protect, allowRoles('admin', 'owner'), async (req
     { upsert: true, new: true }
   );
   res.json({ success: true, fee });
+});
+
+// ========== Agent Delivery Fee (NEW) ==========
+router.get('/agent-delivery-fee', async (req, res) => {
+  const value = await getSetting('agentDeliveryFee') || 0;
+  res.json({ value });
+});
+
+router.put('/agent-delivery-fee', protect, allowRoles('admin', 'owner'), async (req, res) => {
+  const { fee } = req.body;
+  if (fee === undefined || fee < 0) {
+    return res.status(400).json({ error: 'Fee must be a non-negative number' });
+  }
+  await Settings.findOneAndUpdate(
+    { key: 'agentDeliveryFee' },
+    { key: 'agentDeliveryFee', value: fee },
+    { upsert: true, new: true }
+  );
+  res.json({ success: true, value: fee });
+});
+
+// ========== Station Pickup Fee (NEW) ==========
+router.get('/station-pickup-fee', async (req, res) => {
+  const value = await getSetting('stationPickupFee') || 0;
+  res.json({ value });
+});
+
+router.put('/station-pickup-fee', protect, allowRoles('admin', 'owner'), async (req, res) => {
+  const { fee } = req.body;
+  if (fee === undefined || fee < 0) {
+    return res.status(400).json({ error: 'Fee must be a non-negative number' });
+  }
+  await Settings.findOneAndUpdate(
+    { key: 'stationPickupFee' },
+    { key: 'stationPickupFee', value: fee },
+    { upsert: true, new: true }
+  );
+  res.json({ success: true, value: fee });
+});
+
+// ========== Generic setting getter (for other routes) ==========
+router.get('/:key', async (req, res) => {
+  try {
+    const { key } = req.params;
+    const value = await getSetting(key);
+    res.json({ key, value: value || 0 });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // ========== Stripe Publishable Key ==========
