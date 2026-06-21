@@ -178,33 +178,61 @@ app.use('/api/notifications', notificationRoutes);
 const { protect } = require('./middleware/auth');
 
 // ========== Payment endpoints ==========
-
-// Stripe Payment Intent
+// Stripe Payment Intent (frontend confirms, no redirects)
 app.post('/api/create-payment-intent', protect, async (req, res) => {
   const { amount, currency, paymentMethodId, orderId } = req.body;
+  
+  // Validate required fields
   if (!amount || !paymentMethodId) {
     return res.status(400).json({ error: 'Missing amount or payment method' });
   }
+
+  // Validate amount is positive
+  if (amount <= 0) {
+    return res.status(400).json({ error: 'Amount must be greater than 0' });
+  }
+
+  // Convert amount to cents (Stripe expects the smallest currency unit)
+  // For KES, 1 KES = 100 cents
+  let amountInCents;
+  if (currency === 'kes' || currency === 'KES') {
+    // Ensure we don't have floating-point errors
+    amountInCents = Math.round(amount * 100);
+    // Stripe minimum for KES is 50 KES = 5000 cents
+    if (amountInCents < 5000) {
+      return res.status(400).json({ error: 'Minimum payment amount is KES 50' });
+    }
+  } else {
+    // For other currencies, assume 2 decimal places
+    amountInCents = Math.round(amount * 100);
+  }
+
   try {
+    // Create PaymentIntent – do NOT confirm on backend
     const paymentIntent = await stripe.paymentIntents.create({
-      amount: Math.round(amount),
+      amount: amountInCents,                      // in cents
       currency: currency || 'kes',
       payment_method: paymentMethodId,
-      confirm: false,                // do not confirm here – frontend will confirm
+      confirmation_method: 'manual',              // frontend will confirm
+      confirm: false,                             // do not confirm here
       metadata: { orderId: orderId || 'unknown' },
       automatic_payment_methods: {
         enabled: true,
-        allow_redirects: 'never'    // frontend handles redirect via confirmCardPayment
+        allow_redirects: 'never'                  // handle redirects via frontend confirmCardPayment
       }
-      // Do NOT include confirmation_method – it conflicts with automatic_payment_methods
     });
-    res.json({ success: true, clientSecret: paymentIntent.client_secret, paymentIntentId: paymentIntent.id });
+
+    // Return client secret to frontend
+    res.json({
+      success: true,
+      clientSecret: paymentIntent.client_secret,
+      paymentIntentId: paymentIntent.id
+    });
   } catch (error) {
     console.error('Stripe error:', error);
     res.status(500).json({ error: error.message });
   }
 });
-
 // ---------- M-Pesa Configuration ----------
 const CONSUMER_KEY = process.env.CONSUMER_KEY;
 const CONSUMER_SECRET = process.env.CONSUMER_SECRET;
