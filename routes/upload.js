@@ -5,13 +5,16 @@ const { protect } = require('../middleware/auth');
 
 const router = express.Router();
 
-// Validate Cloudinary config
-const cloudName = process.env.CLOUDINARY_CLOUD_NAME;
-const apiKey = process.env.CLOUDINARY_API_KEY;
-const apiSecret = process.env.CLOUDINARY_API_SECRET;
+// Trim environment variables to remove accidental whitespace
+const cloudName = (process.env.CLOUDINARY_CLOUD_NAME || '').trim();
+const apiKey = (process.env.CLOUDINARY_API_KEY || '').trim();
+const apiSecret = (process.env.CLOUDINARY_API_SECRET || '').trim();
 
 if (!cloudName || !apiKey || !apiSecret) {
   console.error('❌ Cloudinary credentials missing! Check Render env.');
+  console.error('   cloudName:', cloudName ? 'present' : 'missing');
+  console.error('   apiKey:', apiKey ? 'present' : 'missing');
+  console.error('   apiSecret:', apiSecret ? 'present' : 'missing');
 } else {
   console.log('✅ Cloudinary configured with cloud_name:', cloudName);
 }
@@ -22,11 +25,11 @@ cloudinary.config({
   api_secret: apiSecret
 });
 
-// Use memory storage (no CloudinaryStorage)
+// Use memory storage
 const storage = multer.memoryStorage();
 const upload = multer({
   storage,
-  limits: { fileSize: 5 * 1024 * 1024 } // 5MB
+  limits: { fileSize: 5 * 1024 * 1024 }
 });
 
 const handleMulterError = (err, req, res, next) => {
@@ -62,7 +65,7 @@ router.post(
         return res.status(400).json({ error: 'No file uploaded. Field name must be "image".' });
       }
 
-      // Upload the file buffer to Cloudinary
+      // Upload buffer to Cloudinary
       const result = await new Promise((resolve, reject) => {
         const uploadStream = cloudinary.uploader.upload_stream(
           {
