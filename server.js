@@ -62,7 +62,7 @@ app.use(cookieParser());
 app.use(compression());
 app.use(morgan('combined'));
 
-// Health check endpoint (for uptime monitoring)
+// ========== Health check (no rate limit) ==========
 app.get('/api/health', (req, res) => {
   res.status(200).json({
     status: 'ok',
@@ -71,20 +71,16 @@ app.get('/api/health', (req, res) => {
   });
 });
 
-// ========== Trust proxy (for Render) ==========
-app.set('trust proxy', true);
+// ========== Trust proxy (Render) ==========
+app.set('trust proxy', 1); // ✅ Prevents permissive warning
 
 // ---------- Rate limiting ----------
 const limiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 200,
-  skip: (req) => req.path.startsWith('/api/notifications'),
-  handler: (req, res) => {
-    res.status(429).json({ error: 'Too many requests, please try again later.' });
-  },
+  skip: (req) => req.path.startsWith('/api/notifications') || req.path === '/api/health',
 });
 app.use('/api/', limiter);
-
 
 // ---------- Stripe webhook (raw body) ----------
 app.post(
@@ -178,6 +174,29 @@ app.post(
 // ---------- JSON parser (after webhook) ----------
 app.use(express.json({ limit: '10mb' }));
 
+// ========== ✅ MIDDLEWARE ORDER FIX – BEFORE ROUTES ==========
+
+// 1. Attach `req.setCsrfToken()` so auth routes can use it
+app.use((req, res, next) => {
+  req.setCsrfToken = () => setCsrfToken(req, res);
+  next();
+});
+
+// 2. CSRF verification (excluding whitelisted paths)
+const csrfExcludedPaths = [
+  '/api/auth/login',
+  '/api/auth/register',
+  '/api/auth/logout',
+  '/api/stripe/webhook',
+  '/api/mpesa/callback'
+];
+app.use((req, res, next) => {
+  if (csrfExcludedPaths.includes(req.path)) {
+    return next();
+  }
+  verifyCsrfToken(req, res, next);
+});
+
 // ---------- MongoDB connection ----------
 mongoose
   .connect(process.env.MONGO_URI)
@@ -211,7 +230,7 @@ async function createOwnerIfNotExists() {
   }
 }
 
-// ---------- Routes ----------
+// ---------- Routes (NOW AFTER MIDDLEWARE) ----------
 app.use('/api/auth', authRoutes);
 app.use('/api/users', userRoutes);
 app.use('/api/categories', categoryRoutes);
@@ -230,31 +249,6 @@ app.use('/api/upload', uploadRoutes);
 app.use('/api/settlements', settlementRoutes);
 app.use('/api/withdrawals', withdrawalRoutes);
 app.use('/api/notifications', notificationRoutes);
-app.use((req, res, next) => {
-  req.setCsrfToken = () => setCsrfToken(req, res);
-  next();
-});
-
-// Helper to set CSRF token (attached to req)
-app.use((req, res, next) => {
-  req.setCsrfToken = () => setCsrfToken(req, res);
-  next();
-});
-
-// Exclude certain routes from CSRF verification
-const csrfExcludedPaths = [
-  '/api/auth/login',
-  '/api/auth/register',
-  '/api/auth/logout',
-  '/api/stripe/webhook',
-  '/api/mpesa/callback'
-];
-app.use((req, res, next) => {
-  if (csrfExcludedPaths.includes(req.path)) {
-    return next();
-  }
-  verifyCsrfToken(req, res, next);
-});
 
 // ---------- M‑Pesa Configuration ----------
 const CONSUMER_KEY = process.env.CONSUMER_KEY;
