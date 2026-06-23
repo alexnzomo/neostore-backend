@@ -71,6 +71,9 @@ app.get('/api/health', (req, res) => {
   });
 });
 
+// ========== Trust proxy (for Render) ==========
+app.set('trust proxy', true);
+
 // ---------- Rate limiting ----------
 const limiter = rateLimit({
   windowMs: 15 * 60 * 1000,
