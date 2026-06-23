@@ -62,6 +62,15 @@ app.use(cookieParser());
 app.use(compression());
 app.use(morgan('combined'));
 
+// Health check endpoint (for uptime monitoring)
+app.get('/api/health', (req, res) => {
+  res.status(200).json({
+    status: 'ok',
+    timestamp: new Date().toISOString(),
+    uptime: process.uptime()
+  });
+});
+
 // ---------- Rate limiting ----------
 const limiter = rateLimit({
   windowMs: 15 * 60 * 1000,
@@ -72,6 +81,7 @@ const limiter = rateLimit({
   },
 });
 app.use('/api/', limiter);
+
 
 // ---------- Stripe webhook (raw body) ----------
 app.post(
