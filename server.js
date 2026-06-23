@@ -5,31 +5,24 @@ const cors = require('cors');
 const cookieParser = require('cookie-parser');
 const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
-const axios = require('axios');
-const SibApiV3Sdk = require('sib-api-v3-sdk');
-const bcrypt = require('bcrypt');
-const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
-
 const compression = require('compression');
 const morgan = require('morgan');
-const sanitizeHtml = require('sanitize-html');
+const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
+const axios = require('axios');
+const bcrypt = require('bcrypt');
 const cron = require('node-cron');
 
 // ========== Models ==========
 const User = require('./models/User');
 const Order = require('./models/Order');
 const Product = require('./models/Product');
-const SponsorshipRequest = require('./models/SponsorshipRequest');
-const notificationRoutes = require('./routes/notifications');
+const TopUpRequest = require('./models/TopUpRequest');
 
-// ========== Utils ==========
-const { cancelOrder } = require('./utils/orderUtils');
+// ========== Services ==========
+const WalletService = require('./services/walletService');
+const { createNotification } = require('./utils/notifications');
 
 // ========== Routes ==========
-const walletRoutes = require('./routes/wallet');
-const uploadRoutes = require('./routes/upload');
-const settlementRoutes = require('./routes/settlements');
-const withdrawalRoutes = require('./routes/withdrawals');
 const authRoutes = require('./routes/auth');
 const userRoutes = require('./routes/users');
 const categoryRoutes = require('./routes/categories');
@@ -43,89 +36,140 @@ const settingsRoutes = require('./routes/settings');
 const discountRoutes = require('./routes/discounts');
 const pickupApplicationRoutes = require('./routes/pickupApplications');
 const kycRoutes = require('./routes/kyc');
+const walletRoutes = require('./routes/wallet');
+const uploadRoutes = require('./routes/upload');
+const settlementRoutes = require('./routes/settlements');
+const withdrawalRoutes = require('./routes/withdrawals');
+const notificationRoutes = require('./routes/notifications');
 
+// ========== Middleware ==========
+const { protect } = require('./middleware/auth');
+const { allowRoles } = require('./middleware/roleCheck');
+const { setCsrfToken, verifyCsrfToken } = require('./middleware/csrf');
+
+// ========== App Setup ==========
 const app = express();
 
 // ---------- Security & middleware ----------
 app.use(helmet());
-app.use(cors({ origin: process.env.CORS_ORIGIN, credentials: true }));
+app.use(
+  cors({
+    origin: process.env.CORS_ORIGIN || 'https://shimmering-brigadeiros-8c1154.netlify.app',
+    credentials: true,
+  })
+);
 app.use(cookieParser());
-app.use(express.json({ limit: '10mb' }));
-
 app.use(compression());
 app.use(morgan('combined'));
 
-// Global rate limit
+// ---------- Rate limiting ----------
 const limiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 200,
-  skip: (req) => req.path.startsWith('/api/notifications'), // skip notifications
+  skip: (req) => req.path.startsWith('/api/notifications'),
   handler: (req, res) => {
     res.status(429).json({ error: 'Too many requests, please try again later.' });
-  }
+  },
 });
 app.use('/api/', limiter);
 
 // ---------- Stripe webhook (raw body) ----------
-app.post('/api/stripe/webhook', express.raw({type: 'application/json'}), async (req, res) => {
-  const sig = req.headers['stripe-signature'];
-  let event;
-  try {
-    event = stripe.webhooks.constructEvent(req.body, sig, process.env.STRIPE_WEBHOOK_SECRET);
-  } catch (err) {
-    console.log(`⚠️ Webhook signature verification failed.`, err.message);
-    return res.status(400).send(`Webhook Error: ${err.message}`);
-  }
+app.post(
+  '/api/stripe/webhook',
+  express.raw({ type: 'application/json' }),
+  async (req, res) => {
+    const sig = req.headers['stripe-signature'];
+    let event;
+    try {
+      event = stripe.webhooks.constructEvent(
+        req.body,
+        sig,
+        process.env.STRIPE_WEBHOOK_SECRET
+      );
+    } catch (err) {
+      console.log(`⚠️ Webhook signature verification failed.`, err.message);
+      return res.status(400).send(`Webhook Error: ${err.message}`);
+    }
 
-  switch (event.type) {
-    case 'payment_intent.succeeded': {
-      const paymentIntent = event.data.object;
-      const metadata = paymentIntent.metadata;
-      console.log(`✅ PaymentIntent succeeded: ${paymentIntent.id}`);
+    switch (event.type) {
+      case 'payment_intent.succeeded': {
+        const paymentIntent = event.data.object;
+        const metadata = paymentIntent.metadata;
+        console.log(`✅ PaymentIntent succeeded: ${paymentIntent.id}`);
 
-      if (metadata.type === 'sponsorship') {
-        const productId = metadata.productId;
-        const days = parseInt(metadata.days);
-        if (productId && days) {
-          const product = await Product.findById(productId);
-          if (product) {
-            product.sponsored = true;
-            product.sponsoredUntil = new Date(Date.now() + days * 24 * 60 * 60 * 1000);
-            await product.save();
-            console.log(`⭐ Product ${product.name} (${productId}) sponsored for ${days} days via Stripe.`);
+        // ===== WALLET TOP‑UP =====
+        if (metadata.type === 'wallet_topup') {
+          const userId = metadata.userId;
+          const amount = parseFloat(metadata.amount);
+          if (userId && amount) {
+            await WalletService.credit(
+              userId,
+              amount,
+              `Wallet top‑up via Stripe (${paymentIntent.id})`,
+              paymentIntent.id,
+              'topup'
+            );
+            await createNotification(
+              userId,
+              'system',
+              'Wallet top‑up successful',
+              `Your wallet has been credited with KES ${amount.toFixed(2)} via Stripe.`,
+              '/account.html'
+            );
+            console.log(`💰 Wallet credited: ${amount} KES for user ${userId}`);
           }
         }
-      } else {
-        const orderId = metadata.orderId;
-        if (orderId) {
-          await Order.findByIdAndUpdate(orderId, {
-            paymentStatus: 'fully_paid',
-            stripePaymentIntentId: paymentIntent.id
-          });
-          console.log(`✅ Order ${orderId} marked as fully paid.`);
+        // ===== SPONSORSHIP =====
+        else if (metadata.type === 'sponsorship') {
+          const productId = metadata.productId;
+          const days = parseInt(metadata.days);
+          if (productId && days) {
+            const product = await Product.findById(productId);
+            if (product) {
+              product.sponsored = true;
+              product.sponsoredUntil = new Date(Date.now() + days * 24 * 60 * 60 * 1000);
+              await product.save();
+              console.log(`⭐ Product ${product.name} (${productId}) sponsored for ${days} days via Stripe.`);
+            }
+          }
         }
+        // ===== ORDER PAYMENT =====
+        else {
+          const orderId = metadata.orderId;
+          if (orderId) {
+            await Order.findByIdAndUpdate(orderId, {
+              paymentStatus: 'fully_paid',
+              stripePaymentIntentId: paymentIntent.id,
+            });
+            console.log(`✅ Order ${orderId} marked as fully paid.`);
+          }
+        }
+        break;
       }
-      break;
-    }
-    case 'payment_intent.payment_failed': {
-      const failedIntent = event.data.object;
-      const orderId = failedIntent.metadata.orderId;
-      if (orderId) {
-        await Order.findByIdAndUpdate(orderId, { paymentStatus: 'payment_failed' });
-        console.log(`❌ Order ${orderId} payment failed.`);
+      case 'payment_intent.payment_failed': {
+        const failedIntent = event.data.object;
+        const orderId = failedIntent.metadata.orderId;
+        if (orderId) {
+          await Order.findByIdAndUpdate(orderId, { paymentStatus: 'payment_failed' });
+          console.log(`❌ Order ${orderId} payment failed.`);
+        }
+        break;
       }
-      break;
+      default:
+        console.log(`Unhandled event type ${event.type}`);
     }
-    default:
-      console.log(`Unhandled event type ${event.type}`);
+    res.json({ received: true });
   }
-  res.json({ received: true });
-});
+);
+
+// ---------- JSON parser (after webhook) ----------
+app.use(express.json({ limit: '10mb' }));
 
 // ---------- MongoDB connection ----------
-mongoose.connect(process.env.MONGO_URI)
+mongoose
+  .connect(process.env.MONGO_URI)
   .then(() => console.log('✅ MongoDB connected'))
-  .catch(err => console.error('❌ MongoDB connection error:', err));
+  .catch((err) => console.error('❌ MongoDB connection error:', err));
 
 // ---------- Owner creation ----------
 async function createOwnerIfNotExists() {
@@ -143,9 +187,9 @@ async function createOwnerIfNotExists() {
       userId,
       fullName: 'Platform Owner',
       email: ownerEmail,
-      password: ownerPasswordHash || await bcrypt.hash('ChangeMe123!', 12),
+      password: ownerPasswordHash || (await bcrypt.hash('ChangeMe123!', 12)),
       role: 'owner',
-      emailVerified: true
+      emailVerified: true,
     });
     await ownerUser.save();
     console.log('✅ Owner account created');
@@ -154,7 +198,7 @@ async function createOwnerIfNotExists() {
   }
 }
 
-// ---------- Register routes ----------
+// ---------- Routes ----------
 app.use('/api/auth', authRoutes);
 app.use('/api/users', userRoutes);
 app.use('/api/categories', categoryRoutes);
@@ -167,71 +211,39 @@ app.use('/api/reviews', reviewRoutes);
 app.use('/api/settings', settingsRoutes);
 app.use('/api/discounts', discountRoutes);
 app.use('/api/pickup/applications', pickupApplicationRoutes);
+app.use('/api/kyc', kycRoutes);
 app.use('/api/wallet', walletRoutes);
 app.use('/api/upload', uploadRoutes);
 app.use('/api/settlements', settlementRoutes);
 app.use('/api/withdrawals', withdrawalRoutes);
-app.use('/api/kyc', kycRoutes);
 app.use('/api/notifications', notificationRoutes);
-
-// ---------- Auth middleware for payment endpoints ----------
-const { protect } = require('./middleware/auth');
-
-// ========== Payment endpoints ==========
-// Stripe Payment Intent (frontend confirms via confirmCardPayment)
-app.post('/api/create-payment-intent', protect, async (req, res) => {
-  const { amount, currency, paymentMethodId, orderId } = req.body;
-
-  // Validate required fields
-  if (!amount || !paymentMethodId) {
-    return res.status(400).json({ error: 'Missing amount or payment method' });
-  }
-  if (amount <= 0) {
-    return res.status(400).json({ error: 'Amount must be greater than 0' });
-  }
-
-  // Convert amount to cents (Stripe expects the smallest currency unit)
-  // For KES, 1 KES = 100 cents
-  let amountInCents;
-  if (currency === 'kes' || currency === 'KES') {
-    amountInCents = Math.round(amount * 100);
-    // Stripe minimum for KES is 50 KES = 5000 cents
-    if (amountInCents < 5000) {
-      return res.status(400).json({ error: 'Minimum payment amount is KES 50' });
-    }
-  } else {
-    // For other currencies, assume 2 decimal places
-    amountInCents = Math.round(amount * 100);
-  }
-
-  try {
-    // Create PaymentIntent – do NOT confirm on backend
-    const paymentIntent = await stripe.paymentIntents.create({
-      amount: amountInCents,                      // in cents
-      currency: currency || 'kes',
-      payment_method: paymentMethodId,
-      confirm: false,                             // frontend will confirm
-      metadata: { orderId: orderId || 'unknown' },
-      automatic_payment_methods: {
-        enabled: true,
-        allow_redirects: 'never'                  // handle redirects via frontend confirmCardPayment
-      }
-      // Do NOT set confirmation_method – it conflicts with automatic_payment_methods
-    });
-
-    // Return client secret to frontend
-    res.json({
-      success: true,
-      clientSecret: paymentIntent.client_secret,
-      paymentIntentId: paymentIntent.id
-    });
-  } catch (error) {
-    console.error('Stripe error:', error);
-    res.status(500).json({ error: error.message });
-  }
+app.use((req, res, next) => {
+  req.setCsrfToken = () => setCsrfToken(req, res);
+  next();
 });
 
-// ---------- M-Pesa Configuration ----------
+// Helper to set CSRF token (attached to req)
+app.use((req, res, next) => {
+  req.setCsrfToken = () => setCsrfToken(req, res);
+  next();
+});
+
+// Exclude certain routes from CSRF verification
+const csrfExcludedPaths = [
+  '/api/auth/login',
+  '/api/auth/register',
+  '/api/auth/logout',
+  '/api/stripe/webhook',
+  '/api/mpesa/callback'
+];
+app.use((req, res, next) => {
+  if (csrfExcludedPaths.includes(req.path)) {
+    return next();
+  }
+  verifyCsrfToken(req, res, next);
+});
+
+// ---------- M‑Pesa Configuration ----------
 const CONSUMER_KEY = process.env.CONSUMER_KEY;
 const CONSUMER_SECRET = process.env.CONSUMER_SECRET;
 const PASSKEY = process.env.PASSKEY || 'bfb279f9aa9bdbcf158e97dd71a467cd2e0c893059b10f78e6b72ada1ed2c919';
@@ -247,66 +259,111 @@ async function getAccessToken() {
   return response.data.access_token;
 }
 
-// M-Pesa STK Push
-app.post('/api/mpesa/stkpush', protect, async (req, res) => {
-  const { phoneNumber, amount, orderId } = req.body;
-  if (!phoneNumber || !amount) return res.status(400).json({ error: 'Phone and amount required' });
+// ===== M‑Pesa initiation helper =====
+async function initiateMpesaPayment(phoneNumber, amount, accountRef) {
   let formattedPhone = phoneNumber.toString().replace(/\D/g, '');
   if (formattedPhone.startsWith('0')) formattedPhone = '254' + formattedPhone.slice(1);
   if (!formattedPhone.startsWith('254')) formattedPhone = '254' + formattedPhone;
+
   const timestamp = new Date().toISOString().replace(/[^0-9]/g, '').slice(0, 14);
   const password = Buffer.from(SHORTCODE + PASSKEY + timestamp).toString('base64');
-  try {
-    const token = await getAccessToken();
-    const response = await axios.post(
-      'https://sandbox.safaricom.co.ke/mpesa/stkpush/v1/processrequest',
-      {
-        BusinessShortCode: SHORTCODE,
-        Password: password,
-        Timestamp: timestamp,
-        TransactionType: 'CustomerPayBillOnline',
-        Amount: Math.round(amount),
-        PartyA: formattedPhone,
-        PartyB: SHORTCODE,
-        PhoneNumber: formattedPhone,
-        CallBackURL: CALLBACK_URL,
-        AccountReference: `ORDER${orderId || Date.now()}`,
-        TransactionDesc: 'NeoStore payment'
-      },
-      { headers: { Authorization: `Bearer ${token}` } }
-    );
 
-    const mpesaResponse = response.data;
-    if (mpesaResponse.ResponseCode === "0") {
-      const { orderId } = req.body;
+  const token = await getAccessToken();
+
+  const response = await axios.post(
+    'https://sandbox.safaricom.co.ke/mpesa/stkpush/v1/processrequest',
+    {
+      BusinessShortCode: SHORTCODE,
+      Password: password,
+      Timestamp: timestamp,
+      TransactionType: 'CustomerPayBillOnline',
+      Amount: Math.round(amount),
+      PartyA: formattedPhone,
+      PartyB: SHORTCODE,
+      PhoneNumber: formattedPhone,
+      CallBackURL: CALLBACK_URL,
+      AccountReference: accountRef,
+      TransactionDesc: 'NeoStore payment',
+    },
+    { headers: { Authorization: `Bearer ${token}` } }
+  );
+  return response.data;
+}
+
+// ===== Attach helper to global so wallet.js can use it =====
+global.initiateMpesaPayment = initiateMpesaPayment;
+
+// ---------- M‑Pesa STK Push endpoint (order payments) ----------
+app.post('/api/mpesa/stkpush', protect, async (req, res) => {
+  const { phoneNumber, amount, orderId } = req.body;
+  if (!phoneNumber || !amount)
+    return res.status(400).json({ error: 'Phone and amount required' });
+
+  try {
+    const accountRef = `ORDER${orderId || Date.now()}`;
+    const response = await initiateMpesaPayment(phoneNumber, amount, accountRef);
+    if (response.ResponseCode === '0') {
       if (orderId) {
-        const Order = require('./models/Order');
         await Order.findByIdAndUpdate(orderId, {
-          mpesaMerchantRequestId: mpesaResponse.MerchantRequestID,
-          mpesaCheckoutRequestId: mpesaResponse.CheckoutRequestID
+          mpesaMerchantRequestId: response.MerchantRequestID,
+          mpesaCheckoutRequestId: response.CheckoutRequestID,
         });
       }
     }
-    res.json({ success: true, data: response.data });
+    res.json({ success: true, data: response });
   } catch (error) {
     console.error(error.response?.data || error.message);
     res.status(500).json({ error: 'Payment initiation failed', details: error.response?.data });
   }
 });
 
-// M-Pesa Callback
+// ---------- M‑Pesa Callback ----------
 app.post('/api/mpesa/callback', async (req, res) => {
   console.log('M-Pesa Callback received:', JSON.stringify(req.body, null, 2));
   try {
     const callbackData = req.body.Body.stkCallback;
     const resultCode = callbackData.ResultCode;
     const merchantRequestId = callbackData.MerchantRequestID;
-    const transactionId = callbackData.CallbackMetadata?.Item?.find(item => item.Name === "MpesaReceiptNumber")?.Value;
-    const amount = callbackData.CallbackMetadata?.Item?.find(item => item.Name === "Amount")?.Value;
-    const accountRef = callbackData.AccountReference; // if available
+    const transactionId = callbackData.CallbackMetadata?.Item?.find(
+      (item) => item.Name === 'MpesaReceiptNumber'
+    )?.Value;
+    const amount = callbackData.CallbackMetadata?.Item?.find(
+      (item) => item.Name === 'Amount'
+    )?.Value;
+    const accountRef = callbackData.AccountReference;
 
-    // Check if it's a sponsorship callback
+    // ===== WALLET TOP‑UP =====
+    if (accountRef && accountRef.startsWith('TOPUP-')) {
+      const topUp = await TopUpRequest.findOne({ merchantRequestId, status: 'pending' });
+      if (topUp) {
+        if (resultCode === 0) {
+          await WalletService.credit(
+            topUp.userId,
+            topUp.amount,
+            `Wallet top‑up via M‑Pesa (${transactionId})`,
+            transactionId,
+            'topup'
+          );
+          topUp.status = 'completed';
+          await createNotification(
+            topUp.userId,
+            'system',
+            'Wallet top‑up successful',
+            `Your wallet has been credited with KES ${topUp.amount.toFixed(2)} via M‑Pesa.`,
+            '/account.html'
+          );
+          console.log(`💰 Wallet credited via M‑Pesa for user ${topUp.userId}`);
+        } else {
+          topUp.status = 'failed';
+        }
+        await topUp.save();
+      }
+      return res.json({ ResultCode: 0, ResultDesc: 'Success' });
+    }
+
+    // ===== SPONSORSHIP =====
     if (accountRef && accountRef.startsWith('SPONSOR')) {
+      const SponsorshipRequest = require('./models/SponsorshipRequest');
       const pendingRequest = await SponsorshipRequest.findOne({ merchantRequestId, status: 'pending' });
       if (pendingRequest) {
         if (resultCode === 0) {
@@ -322,18 +379,16 @@ app.post('/api/mpesa/callback', async (req, res) => {
           pendingRequest.status = 'failed';
         }
         await pendingRequest.save();
-      } else {
-        console.log(`No pending sponsorship request for MerchantRequestID: ${merchantRequestId}`);
       }
       return res.json({ ResultCode: 0, ResultDesc: 'Success' });
     }
 
-    // Regular order handling
+    // ===== ORDER PAYMENT =====
     const Order = require('./models/Order');
     const order = await Order.findOne({ mpesaMerchantRequestId: merchantRequestId });
     if (!order) {
       console.error(`Order not found for MerchantRequestID: ${merchantRequestId}`);
-      return res.status(404).json({ ResultCode: 1, ResultDesc: "Order not found" });
+      return res.status(404).json({ ResultCode: 1, ResultDesc: 'Order not found' });
     }
 
     if (resultCode === 0) {
@@ -348,16 +403,58 @@ app.post('/api/mpesa/callback', async (req, res) => {
       await order.save();
       console.log(`Order ${order.orderId} M-Pesa payment failed: ${callbackData.ResultDesc}`);
     }
-    res.json({ ResultCode: 0, ResultDesc: "Success" });
+    res.json({ ResultCode: 0, ResultDesc: 'Success' });
   } catch (error) {
     console.error('M-Pesa callback error:', error);
-    res.status(500).json({ ResultCode: 1, ResultDesc: "Internal server error" });
+    res.status(500).json({ ResultCode: 1, ResultDesc: 'Internal server error' });
   }
 });
 
-// ---------- Email endpoints (your existing ones – unchanged) ----------
-// (I'll keep the placeholder, but you need to paste your full email code here)
-// For brevity, I'm leaving a comment, but in your actual file, you have the full code.
+// ---------- Payment Intent endpoint (Stripe) ----------
+app.post('/api/create-payment-intent', protect, async (req, res) => {
+  const { amount, currency, paymentMethodId, orderId } = req.body;
+  if (!amount || !paymentMethodId)
+    return res.status(400).json({ error: 'Missing amount or payment method' });
+  if (amount <= 0) return res.status(400).json({ error: 'Amount must be greater than 0' });
+
+  let amountInCents = Math.round(amount * 100);
+  if (currency === 'kes' || currency === 'KES') {
+    if (amountInCents < 5000) return res.status(400).json({ error: 'Minimum payment amount is KES 50' });
+  }
+
+  try {
+    const paymentIntent = await stripe.paymentIntents.create({
+      amount: amountInCents,
+      currency: currency || 'kes',
+      payment_method: paymentMethodId,
+      confirm: false,
+      metadata: { orderId: orderId || 'unknown' },
+      automatic_payment_methods: {
+        enabled: true,
+        allow_redirects: 'never',
+      },
+    });
+    res.json({
+      success: true,
+      clientSecret: paymentIntent.client_secret,
+      paymentIntentId: paymentIntent.id,
+    });
+  } catch (error) {
+    console.error('Stripe error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ---------- Cloudinary test route (optional, temporary) ----------
+app.get('/api/test-cloudinary', async (req, res) => {
+  const cloudinary = require('cloudinary').v2;
+  try {
+    const result = await cloudinary.api.ping();
+    res.json({ success: true, result });
+  } catch (err) {
+    res.status(500).json({ error: err.message, stack: err.stack });
+  }
+});
 
 // ---------- Basic error handler ----------
 app.use((err, req, res, next) => {
@@ -373,10 +470,11 @@ cron.schedule('0 0 * * *', async () => {
     const cutoffDate = new Date();
     cutoffDate.setDate(cutoffDate.getDate() - AUTO_CANCEL_DAYS);
 
+    const { cancelOrder } = require('./utils/orderUtils');
     const ordersToCancel = await Order.find({
       deliveryStatus: { $in: ['pending', 'processing'] },
       createdAt: { $lt: cutoffDate },
-      paymentStatus: { $ne: 'refunded' }
+      paymentStatus: { $ne: 'refunded' },
     });
 
     for (const order of ordersToCancel) {
@@ -392,7 +490,6 @@ cron.schedule('0 0 * * *', async () => {
     console.error('Auto-cancel cron error:', err);
   }
 });
-
 
 // ---------- Start server ----------
 const PORT = process.env.PORT || 5000;

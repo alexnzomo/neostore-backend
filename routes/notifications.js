@@ -14,7 +14,7 @@ router.get('/unread', protect, async (req, res) => {
   }
 });
 
-// Get all notifications (paginated) for the current user
+// Get all notifications (paginated)
 router.get('/all', protect, async (req, res) => {
   try {
     const limit = parseInt(req.query.limit) || 50;
@@ -30,13 +30,11 @@ router.get('/all', protect, async (req, res) => {
   }
 });
 
-// Mark a single notification as read
+// Mark single notification as read
 router.put('/:id/read', protect, async (req, res) => {
   try {
     const notification = await Notification.findOne({ _id: req.params.id, userId: req.user._id });
-    if (!notification) {
-      return res.status(404).json({ error: 'Notification not found' });
-    }
+    if (!notification) return res.status(404).json({ error: 'Notification not found' });
     notification.isRead = true;
     await notification.save();
     res.json({ success: true });
@@ -45,7 +43,7 @@ router.put('/:id/read', protect, async (req, res) => {
   }
 });
 
-// Mark all notifications as read for the current user
+// Mark all as read
 router.put('/read-all', protect, async (req, res) => {
   try {
     await Notification.updateMany(
@@ -58,15 +56,44 @@ router.put('/read-all', protect, async (req, res) => {
   }
 });
 
-// Delete a notification (only if it belongs to the current user)
+// Delete a notification
 router.delete('/:id', protect, async (req, res) => {
   try {
     const notification = await Notification.findOne({ _id: req.params.id, userId: req.user._id });
-    if (!notification) {
-      return res.status(404).json({ error: 'Notification not found' });
-    }
+    if (!notification) return res.status(404).json({ error: 'Notification not found' });
     await notification.deleteOne();
     res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ✅ NEW: Create a notification (agent/station/admin/owner only)
+router.post('/', protect, async (req, res) => {
+  try {
+    const { userId, type, title, message, link } = req.body;
+
+    const allowedRoles = ['agent', 'station_manager', 'admin', 'owner'];
+    if (!allowedRoles.includes(req.user.role)) {
+      return res.status(403).json({ error: 'Not authorized to send notifications' });
+    }
+
+    if (!userId || !title || !message) {
+      return res.status(400).json({ error: 'Missing required fields: userId, title, message' });
+    }
+
+    const notification = new Notification({
+      userId,
+      type: type || 'system',
+      title,
+      message,
+      link: link || null,
+      isRead: false,
+      createdAt: new Date()
+    });
+    await notification.save();
+
+    res.status(201).json({ success: true, notification });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }

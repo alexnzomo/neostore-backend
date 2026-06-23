@@ -45,7 +45,7 @@ const orderSchema = new mongoose.Schema({
   shippingFeeKES: { type: Number, default: 0, min: 0 },
   totalKES: { type: Number, required: true, min: 0 },
   paymentStatus: { type: String, enum: ['pending', 'deposit_paid', 'fully_paid', 'cash_collected', 'refunded'], default: 'pending' },
-  deliveryStatus: { type: String, enum: ['pending', 'processing', 'shipped', 'out_for_delivery', 'delivered', 'cancelled'], default: 'pending' },
+  deliveryStatus: { type: String, enum: ['pending', 'processing', 'shipped', 'out_for_delivery', 'ready_for_pickup', 'delivered', 'cancelled'], default: 'pending' },
   paymentMethod: { 
     type: String, 
     // ✅ Added 'wallet' and 'wallet_deposit'

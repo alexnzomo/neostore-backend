@@ -1,5 +1,6 @@
 const express = require('express');
 const User = require('../models/User');
+const PickupStation = require('../models/PickupStation'); // ✅ ADDED
 const { protect } = require('../middleware/auth');
 const { allowRoles } = require('../middleware/roleCheck');
 
@@ -26,7 +27,7 @@ router.get('/:id', protect, allowRoles('admin', 'owner'), async (req, res) => {
   }
 });
 
-// Update user role (owner only – because admin cannot change owner)
+// Update user role (owner only)
 router.put('/:id/role', protect, allowRoles('owner'), async (req, res) => {
   try {
     const { role } = req.body;
@@ -35,13 +36,39 @@ router.put('/:id/role', protect, allowRoles('owner'), async (req, res) => {
     }
     const user = await User.findById(req.params.id);
     if (!user) return res.status(404).json({ error: 'User not found' });
-    // Prevent changing the only owner's role away from owner
     if (user.role === 'owner' && role !== 'owner') {
       return res.status(403).json({ error: 'Cannot demote the platform owner' });
     }
     user.role = role;
     await user.save();
     res.json({ message: 'Role updated', user: { id: user._id, role: user.role } });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ✅ NEW: Assign station to a user (admin/owner only)
+router.put('/:id/assign-station', protect, allowRoles('admin', 'owner'), async (req, res) => {
+  try {
+    const { stationId } = req.body;
+    const user = await User.findById(req.params.id);
+    if (!user) return res.status(404).json({ error: 'User not found' });
+
+    // Optional: Check if the user is a station manager
+    if (user.role !== 'station_manager') {
+      return res.status(400).json({ error: 'User is not a station manager' });
+    }
+
+    // Validate station exists
+    if (stationId) {
+      const station = await PickupStation.findById(stationId);
+      if (!station) return res.status(404).json({ error: 'Station not found' });
+    }
+
+    user.stationId = stationId || null;
+    await user.save();
+
+    res.json({ success: true, user: { id: user._id, stationId: user.stationId } });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -76,7 +103,7 @@ router.delete('/:id', protect, allowRoles('owner'), async (req, res) => {
   }
 });
 
-// Reset password (public, after code verification)
+// Reset password (public)
 router.post('/reset-password', async (req, res) => {
   const { email, newPassword } = req.body;
   if (!email || !newPassword) {
@@ -88,7 +115,7 @@ router.post('/reset-password', async (req, res) => {
   try {
     const user = await User.findOne({ email });
     if (!user) return res.status(404).json({ error: 'User not found' });
-    user.password = newPassword; // will be hashed by pre-save hook
+    user.password = newPassword;
     await user.save();
     res.json({ success: true });
   } catch (err) {

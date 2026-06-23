@@ -1,24 +1,43 @@
 const express = require('express');
 const bcrypt = require('bcrypt');
 const jwt = require('jsonwebtoken');
-const WalletService = require('../services/walletService');
+const { body, validationResult } = require('express-validator');
+
+// Models
 const User = require('../models/User');
 const WalletTransaction = require('../models/WalletTransaction');
 const WalletPIN = require('../models/WalletPIN');
+const TopUpRequest = require('../models/TopUpRequest');
+
+// Services & Helpers
+const WalletService = require('../services/walletService');
+const { createNotification } = require('../utils/notifications');
+const { sendEmail } = require('../utils/email');
+
+// Middleware
 const { protect } = require('../middleware/auth');
 const { allowRoles } = require('../middleware/roleCheck');
-const { body, validationResult } = require('express-validator');
 const { requireKYC } = require('../middleware/kyc');
 
-// In-memory OTP store (expires after 5 minutes)
-const otpStore = new Map();
-
-// Helper to send email (import from server.js or use a shared utility)
-const { sendEmail } = require('../utils/email');
+// Stripe (direct import)
+const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
 
 const router = express.Router();
 
-// ========== Helper middleware for PIN‑protected operations ==========
+// ========== In‑memory OTP store ==========
+const otpStore = new Map();
+
+// ========== Helper: M‑Pesa initiation (uses global function from server.js) ==========
+async function initiateMpesaPayment(phoneNumber, amount, accountRef) {
+  if (typeof global.initiateMpesaPayment === 'function') {
+    return global.initiateMpesaPayment(phoneNumber, amount, accountRef);
+  }
+  throw new Error(
+    'M-Pesa initiation function not available. Please attach it to `global.initiateMpesaPayment` in server.js.'
+  );
+}
+
+// ========== Helper: PIN temporary token verification ==========
 const verifyTempToken = async (req, res, next) => {
   const tempToken = req.headers['x-temp-token'] || req.body.tempToken;
   if (!tempToken) {
@@ -39,8 +58,7 @@ const verifyTempToken = async (req, res, next) => {
   }
 };
 
-// ========== Balance & Transactions ==========
-
+// ========== Balance ==========
 router.get('/balance', protect, async (req, res) => {
   try {
     const balance = await WalletService.getBalance(req.user._id);
@@ -50,6 +68,7 @@ router.get('/balance', protect, async (req, res) => {
   }
 });
 
+// ========== Own transactions ==========
 router.get('/transactions', protect, async (req, res) => {
   try {
     const limit = parseInt(req.query.limit) || 50;
@@ -61,6 +80,7 @@ router.get('/transactions', protect, async (req, res) => {
   }
 });
 
+// ========== Single transaction (own only) ==========
 router.get('/transactions/:id', protect, async (req, res) => {
   try {
     const transaction = await WalletTransaction.findById(req.params.id);
@@ -74,58 +94,50 @@ router.get('/transactions/:id', protect, async (req, res) => {
   }
 });
 
-// ========== FIXED: Get transactions for a specific user (admin/owner only) ==========
+// ========== Admin: view any user's transactions ==========
 router.get('/transactions/:userId', protect, allowRoles('admin', 'owner'), async (req, res) => {
   try {
     const { userId } = req.params;
-    
-    // Check if user exists
     const user = await User.findById(userId);
-    if (!user) {
-      return res.status(404).json({ error: 'User not found' });
-    }
-    
-    const limit = parseInt(req.query.limit) || 100;
-    const skip = parseInt(req.query.skip) || 0;
-    
+    if (!user) return res.status(404).json({ error: 'User not found' });
     const transactions = await WalletTransaction.find({ userId })
       .sort({ createdAt: -1 })
-      .skip(skip)
-      .limit(limit);
-    
-    const total = await WalletTransaction.countDocuments({ userId });
-    
-    res.json({ 
-      transactions, 
-      total, 
-      limit, 
-      skip,
-      user: { id: user._id, fullName: user.fullName, email: user.email }
-    });
+      .limit(100);
+    res.json(transactions);
   } catch (err) {
     console.error('Error fetching user transactions:', err);
     res.status(500).json({ error: 'Failed to load transactions: ' + err.message });
   }
 });
 
-router.post('/topup', protect, [
+// ========== OWNER‑ONLY Manual Top‑up ==========
+router.post('/topup', protect, allowRoles('owner'), [
   body('amount').isFloat({ min: 1 }).withMessage('Amount must be at least 1 KES'),
-  body('paymentMethod').isIn(['stripe', 'mpesa']).withMessage('Invalid payment method')
+  body('userId').notEmpty().withMessage('User ID required')
 ], async (req, res) => {
   const errors = validationResult(req);
   if (!errors.isEmpty()) return res.status(400).json({ errors: errors.array() });
 
   try {
-    const { amount, paymentMethod } = req.body;
-    const userId = req.user._id;
+    const { amount, userId } = req.body;
+    const user = await User.findById(userId);
+    if (!user) return res.status(404).json({ error: 'User not found' });
 
     const result = await WalletService.credit(
       userId,
       amount,
-      `Wallet top‑up via ${paymentMethod}`,
+      `Manual top‑up by owner ${req.user.fullName}`,
       null,
       'topup',
-      { paymentMethod }
+      { adminId: req.user._id }
+    );
+
+    await createNotification(
+      userId,
+      'system',
+      'Wallet top‑up',
+      `Your wallet has been credited with KES ${amount.toFixed(2)} by owner.`,
+      '/account.html'
     );
 
     res.json({ success: true, newBalance: result.newBalance, transaction: result.transaction });
@@ -134,6 +146,71 @@ router.post('/topup', protect, [
   }
 });
 
+// ========== Real Payment Top‑up Initiation (Stripe / M‑Pesa) ==========
+router.post('/topup/initiate', protect, [
+  body('amount').isFloat({ min: 1 }).withMessage('Amount must be at least 1 KES'),
+  body('method').isIn(['stripe', 'mpesa']).withMessage('Invalid payment method')
+], async (req, res) => {
+  const errors = validationResult(req);
+  if (!errors.isEmpty()) return res.status(400).json({ errors: errors.array() });
+
+  try {
+    const { amount, method, phoneNumber } = req.body;
+    const userId = req.user._id;
+
+    if (method === 'stripe') {
+      const paymentIntent = await stripe.paymentIntents.create({
+        amount: Math.round(amount * 100), // cents
+        currency: 'kes',
+        metadata: {
+          userId: userId.toString(),
+          type: 'wallet_topup',
+          amount: amount.toString()
+        }
+      });
+      return res.json({
+        success: true,
+        clientSecret: paymentIntent.client_secret,
+        paymentIntentId: paymentIntent.id
+      });
+    }
+
+    if (method === 'mpesa') {
+      if (!phoneNumber) {
+        return res.status(400).json({ error: 'Phone number required for M‑Pesa' });
+      }
+      const mpesaResponse = await initiateMpesaPayment(
+        phoneNumber,
+        amount,
+        `TOPUP-${userId.toString().slice(-6)}`
+      );
+      if (mpesaResponse.ResponseCode === '0') {
+        const topUp = new TopUpRequest({
+          userId,
+          amount,
+          merchantRequestId: mpesaResponse.MerchantRequestID,
+          checkoutRequestId: mpesaResponse.CheckoutRequestID,
+          status: 'pending'
+        });
+        await topUp.save();
+        return res.json({
+          success: true,
+          merchantRequestId: mpesaResponse.MerchantRequestID,
+          message: 'STK push sent. Complete payment on your phone.'
+        });
+      } else {
+        return res.status(400).json({ error: 'Failed to initiate M‑Pesa payment' });
+      }
+    }
+
+    return res.status(400).json({ error: 'Invalid payment method' });
+  } catch (err) {
+    console.error('Top‑up initiation error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ========== Pay from wallet (for orders) ==========
 router.post('/pay', protect, requireKYC, verifyTempToken, [
   body('amount').isFloat({ min: 1 }).withMessage('Amount must be at least 1 KES'),
   body('orderId').notEmpty().withMessage('Order ID required')
@@ -159,6 +236,7 @@ router.post('/pay', protect, requireKYC, verifyTempToken, [
   }
 });
 
+// ========== Transfer between users ==========
 router.post('/transfer', protect, requireKYC, verifyTempToken, [
   body('receiverEmail').isEmail().withMessage('Valid receiver email required'),
   body('amount').isFloat({ min: 1 }).withMessage('Amount must be at least 1 KES')
@@ -181,8 +259,6 @@ router.post('/transfer', protect, requireKYC, verifyTempToken, [
       `Transfer to ${receiver.fullName || receiver.email}`
     );
 
-    // ===== ADD NOTIFICATIONS =====
-    const { createNotification } = require('../utils/notifications');
     if (result.success) {
       await createNotification(
         senderId,
@@ -213,19 +289,16 @@ router.post('/transfer', protect, requireKYC, verifyTempToken, [
 
 // ========== PIN Management ==========
 
-// Request OTP for PIN change
+// Request OTP
 router.post('/pin/request-otp', protect, async (req, res) => {
   try {
     const userId = req.user._id;
     const email = req.user.email;
 
-    // Generate 6-digit OTP
     const otp = Math.floor(100000 + Math.random() * 900000).toString();
-    const expiresAt = Date.now() + 5 * 60 * 1000; // 5 minutes
-
+    const expiresAt = Date.now() + 5 * 60 * 1000;
     otpStore.set(userId.toString(), { otp, expiresAt });
 
-    // Send email
     await sendEmail({
       to: email,
       subject: 'Wallet PIN Verification Code',
@@ -242,7 +315,7 @@ router.post('/pin/request-otp', protect, async (req, res) => {
 // Verify OTP and set PIN
 router.post('/pin/verify-otp', protect, [
   body('otp').isLength({ min: 6, max: 6 }).withMessage('OTP must be 6 digits'),
-  body('newPin').isLength({ min: 4, max: 6 }).withMessage('PIN must be 4-6 digits')
+  body('newPin').isLength({ min: 4, max: 6 }).withMessage('PIN must be 4‑6 digits')
 ], async (req, res) => {
   const errors = validationResult(req);
   if (!errors.isEmpty()) return res.status(400).json({ errors: errors.array() });
@@ -252,25 +325,19 @@ router.post('/pin/verify-otp', protect, [
     const { otp, newPin } = req.body;
 
     const stored = otpStore.get(userId.toString());
-    if (!stored) {
-      return res.status(400).json({ error: 'No OTP request found. Please request a new code.' });
-    }
+    if (!stored) return res.status(400).json({ error: 'No OTP request found. Please request a new code.' });
     if (Date.now() > stored.expiresAt) {
       otpStore.delete(userId.toString());
       return res.status(400).json({ error: 'OTP expired. Please request a new code.' });
     }
-    if (stored.otp !== otp) {
-      return res.status(400).json({ error: 'Invalid OTP.' });
-    }
+    if (stored.otp !== otp) return res.status(400).json({ error: 'Invalid OTP.' });
 
-    // OTP is valid – set PIN
     const pinHash = await bcrypt.hash(newPin, 10);
     await WalletPIN.findOneAndUpdate(
       { userId },
       { userId, pinHash, failedAttempts: 0, lockedUntil: null },
       { upsert: true, new: true }
     );
-
     otpStore.delete(userId.toString());
 
     res.json({ success: true, message: 'PIN set successfully.' });
@@ -280,9 +347,9 @@ router.post('/pin/verify-otp', protect, [
   }
 });
 
-// Verify PIN (existing)
+// Verify PIN (returns temporary token)
 router.post('/pin/verify', protect, [
-  body('pin').isLength({ min: 4, max: 6 }).withMessage('PIN must be 4-6 digits')
+  body('pin').isLength({ min: 4, max: 6 }).withMessage('PIN must be 4‑6 digits')
 ], async (req, res) => {
   const errors = validationResult(req);
   if (!errors.isEmpty()) return res.status(400).json({ errors: errors.array() });
@@ -291,9 +358,7 @@ router.post('/pin/verify', protect, [
     const { pin } = req.body;
     const userId = req.user._id;
     const pinRecord = await WalletPIN.findOne({ userId });
-    if (!pinRecord) {
-      return res.status(404).json({ error: 'PIN not set' });
-    }
+    if (!pinRecord) return res.status(404).json({ error: 'PIN not set' });
     if (pinRecord.lockedUntil && pinRecord.lockedUntil > new Date()) {
       return res.status(403).json({ error: 'PIN locked. Try again later.' });
     }

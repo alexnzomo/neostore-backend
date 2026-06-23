@@ -7,6 +7,7 @@ const WalletService = require('../services/walletService');
 const { protect } = require('../middleware/auth');
 const { allowRoles } = require('../middleware/roleCheck');
 const KYC = require('../models/KYC');
+const { createNotification } = require('../utils/notifications'); // ✅ ADDED
 
 const router = express.Router();
 
@@ -63,7 +64,7 @@ router.get('/', protect, allowRoles('admin', 'owner'), async (req, res) => {
 // Admin: mark settlement as paid (vendor, agent, or station) – auto‑credit wallet
 router.put('/:id/paid', protect, allowRoles('admin', 'owner'), async (req, res) => {
   try {
-    const { type } = req.body; // 'vendor', 'agent', 'station'
+    const { type } = req.body;
     const settlement = await Settlement.findById(req.params.id);
     if (!settlement) return res.status(404).json({ error: 'Settlement not found' });
 
@@ -71,7 +72,6 @@ router.put('/:id/paid', protect, allowRoles('admin', 'owner'), async (req, res) 
     let amount = 0;
     let description = '';
 
-    // Determine which party is being paid and set values
     if (type === 'vendor') {
       if (settlement.vendorPaid) return res.status(400).json({ error: 'Vendor already paid' });
       userId = settlement.vendorId;
@@ -86,7 +86,6 @@ router.put('/:id/paid', protect, allowRoles('admin', 'owner'), async (req, res) 
       settlement.agentPaid = true;
     } else if (type === 'station') {
       if (settlement.stationPaid) return res.status(400).json({ error: 'Station already paid' });
-      // Find the station manager (user who manages this station)
       const station = await PickupStation.findById(settlement.stationId);
       if (!station) return res.status(404).json({ error: 'Station not found' });
       if (!station.managerId) return res.status(400).json({ error: 'Station has no manager assigned' });
@@ -100,16 +99,15 @@ router.put('/:id/paid', protect, allowRoles('admin', 'owner'), async (req, res) 
 
     if (!userId) return res.status(400).json({ error: 'No user to credit' });
 
-    // ========== KYC VERIFICATION ==========
-    // Check if the user has verified KYC before crediting earnings
+    // KYC check
     const kyc = await KYC.findOne({ userId });
     if (!kyc || kyc.status !== 'verified') {
       return res.status(400).json({
-        error: 'User KYC not verified. Cannot process payout. Please complete KYC verification first.'
+        error: 'User KYC not verified. Cannot process payout.'
       });
     }
 
-    // Credit the user's wallet
+    // Credit wallet
     const result = await WalletService.credit(
       userId,
       amount,
@@ -118,6 +116,7 @@ router.put('/:id/paid', protect, allowRoles('admin', 'owner'), async (req, res) 
       'settlement'
     );
 
+    // ✅ Create notification
     await createNotification(
       userId,
       'settlement',
@@ -126,7 +125,7 @@ router.put('/:id/paid', protect, allowRoles('admin', 'owner'), async (req, res) 
       '/account.html'
     );
 
-    // If all parties are paid, set paidAt
+    // If all parties paid, set paidAt
     if (settlement.vendorPaid && settlement.agentPaid && settlement.stationPaid) {
       settlement.paidAt = new Date();
       settlement.settledBy = req.user._id;
