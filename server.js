@@ -41,6 +41,8 @@ const uploadRoutes = require('./routes/upload');
 const settlementRoutes = require('./routes/settlements');
 const withdrawalRoutes = require('./routes/withdrawals');
 const notificationRoutes = require('./routes/notifications');
+const auditRoutes = require('./routes/audit');
+const reportRoutes = require('./routes/reports');
 
 // ========== Middleware ==========
 const { protect } = require('./middleware/auth');
@@ -249,6 +251,8 @@ app.use('/api/upload', uploadRoutes);
 app.use('/api/settlements', settlementRoutes);
 app.use('/api/withdrawals', withdrawalRoutes);
 app.use('/api/notifications', notificationRoutes);
+app.use('/api/audit', auditRoutes);
+app.use('/api/reports', reportRoutes);
 
 // ---------- M‑Pesa Configuration ----------
 const CONSUMER_KEY = process.env.CONSUMER_KEY;

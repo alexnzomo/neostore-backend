@@ -3,6 +3,7 @@ const User = require('../models/User');
 const PickupStation = require('../models/PickupStation'); // ✅ ADDED
 const { protect } = require('../middleware/auth');
 const { allowRoles } = require('../middleware/roleCheck');
+const { logAction } = require('../utils/audit');
 
 const router = express.Router();
 
@@ -41,6 +42,7 @@ router.put('/:id/role', protect, allowRoles('owner'), async (req, res) => {
     }
     user.role = role;
     await user.save();
+    await logAction(req, 'role_change', userId, { oldRole: user.role, newRole: role });
     res.json({ message: 'Role updated', user: { id: user._id, role: user.role } });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -67,6 +69,7 @@ router.put('/:id/assign-station', protect, allowRoles('admin', 'owner'), async (
 
     user.stationId = stationId || null;
     await user.save();
+    await logAction(req, 'station_assign', userId, { stationId });
 
     res.json({ success: true, user: { id: user._id, stationId: user.stationId } });
   } catch (err) {

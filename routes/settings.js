@@ -2,6 +2,7 @@ const express = require('express');
 const Settings = require('../models/Settings');
 const { protect } = require('../middleware/auth');
 const { allowRoles } = require('../middleware/roleCheck');
+const { logAction } = require('../utils/audit');
 
 const router = express.Router();
 
@@ -109,7 +110,7 @@ router.put('/station-pickup-fee', protect, allowRoles('admin', 'owner'), async (
   res.json({ success: true, value: fee });
 });
 
-// ========== Stripe Publishable Key (MOVED ABOVE GENERIC ROUTE) ==========
+// ========== Stripe Publishable Key ==========
 router.get('/stripe-publishable-key', async (req, res) => {
   try {
     const key = process.env.STRIPE_PUBLISHABLE_KEY;
@@ -122,7 +123,24 @@ router.get('/stripe-publishable-key', async (req, res) => {
   }
 });
 
-// ========== Generic setting getter (KEEP LAST – catches all other keys) ==========
+// ========== Withdrawals Freeze ==========
+router.get('/withdrawals-frozen', async (req, res) => {
+  const setting = await Settings.findOne({ key: 'withdrawals_frozen' });
+  res.json({ frozen: setting ? setting.value === 'true' : false });
+});
+
+router.put('/withdrawals-frozen', protect, allowRoles('owner'), async (req, res) => {
+  const { frozen } = req.body;
+  await Settings.findOneAndUpdate(
+    { key: 'withdrawals_frozen' },
+    { key: 'withdrawals_frozen', value: frozen ? 'true' : 'false' },
+    { upsert: true, new: true }
+  );
+  await logAction(req, 'toggle_withdrawal_freeze', null, { frozen });
+  res.json({ success: true, frozen });
+});
+
+// ========== Generic setting getter (fallback – keep LAST) ==========
 router.get('/:key', async (req, res) => {
   try {
     const { key } = req.params;

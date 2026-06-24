@@ -13,6 +13,7 @@ const TopUpRequest = require('../models/TopUpRequest');
 const WalletService = require('../services/walletService');
 const { createNotification } = require('../utils/notifications');
 const { sendEmail } = require('../utils/email');
+const { logAction } = require('../utils/audit');
 
 // Middleware
 const { protect } = require('../middleware/auth');
@@ -95,7 +96,8 @@ router.get('/transactions/:id', protect, async (req, res) => {
 });
 
 // ========== Admin: view any user's transactions ==========
-router.get('/transactions/:userId', protect, allowRoles('admin', 'owner'), async (req, res) => {
+// Fixed path to avoid conflict with /transactions/:id
+router.get('/transactions/user/:userId', protect, allowRoles('admin', 'owner'), async (req, res) => {
   try {
     const { userId } = req.params;
     const user = await User.findById(userId);
@@ -139,6 +141,9 @@ router.post('/topup', protect, allowRoles('owner'), [
       `Your wallet has been credited with KES ${amount.toFixed(2)} by owner.`,
       '/account.html'
     );
+
+    // Audit log
+    await logAction(req, 'manual_topup', userId, { amount, adminId: req.user._id });
 
     res.json({ success: true, newBalance: result.newBalance, transaction: result.transaction });
   } catch (err) {
@@ -382,6 +387,71 @@ router.post('/pin/verify', protect, [
     );
     res.json({ success: true, tempToken });
   } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ========== 🆕 Reverse a wallet transaction (owner only) ==========
+router.post('/reverse-transaction', protect, allowRoles('owner'), [
+  body('transactionId').notEmpty().withMessage('Transaction ID required'),
+  body('reason').notEmpty().withMessage('Reason for reversal required')
+], async (req, res) => {
+  const errors = validationResult(req);
+  if (!errors.isEmpty()) return res.status(400).json({ errors: errors.array() });
+
+  try {
+    const { transactionId, reason } = req.body;
+    const transaction = await WalletTransaction.findById(transactionId);
+    if (!transaction) return res.status(404).json({ error: 'Transaction not found' });
+
+    if (transaction.status === 'reversed') {
+      return res.status(400).json({ error: 'Transaction already reversed' });
+    }
+
+    const isCredit = transaction.type === 'credit' || transaction.type === 'transfer_in';
+    const isDebit = transaction.type === 'debit' || transaction.type === 'transfer_out';
+
+    let newBalance;
+    if (isCredit) {
+      const result = await WalletService.debit(
+        transaction.userId,
+        transaction.amount,
+        `Reversal of ${transaction.description} (${reason})`,
+        transaction._id,
+        'refund'
+      );
+      newBalance = result.newBalance;
+    } else if (isDebit) {
+      const result = await WalletService.credit(
+        transaction.userId,
+        transaction.amount,
+        `Reversal of ${transaction.description} (${reason})`,
+        transaction._id,
+        'refund'
+      );
+      newBalance = result.newBalance;
+    } else {
+      return res.status(400).json({ error: 'Cannot reverse this transaction type' });
+    }
+
+    transaction.status = 'reversed';
+    await transaction.save();
+
+    await logAction(req, 'reverse_transaction', transaction.userId, {
+      originalTransactionId: transaction._id,
+      amount: transaction.amount,
+      reason,
+      newBalance
+    });
+
+    res.json({
+      success: true,
+      message: 'Transaction reversed successfully',
+      newBalance,
+      reversedTransaction: transaction
+    });
+  } catch (err) {
+    console.error('Reversal error:', err);
     res.status(500).json({ error: err.message });
   }
 });

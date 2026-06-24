@@ -8,6 +8,7 @@ const { protect } = require('../middleware/auth');
 const { allowRoles } = require('../middleware/roleCheck');
 const KYC = require('../models/KYC');
 const { createNotification } = require('../utils/notifications'); // ✅ ADDED
+const { logAction } = require('../utils/audit');
 
 const router = express.Router();
 
@@ -115,6 +116,8 @@ router.put('/:id/paid', protect, allowRoles('admin', 'owner'), async (req, res) 
       settlement._id,
       'settlement'
     );
+
+    await logAction(req, 'settlement_payout', userId, { amount, type, settlementId: settlement._id });
 
     // ✅ Create notification
     await createNotification(
