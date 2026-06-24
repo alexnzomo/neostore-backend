@@ -15,7 +15,6 @@ const router = express.Router();
 
 // ========== Helpers ==========
 
-// Helper to check if a station manager is allowed to manage a given order
 async function canStationManageOrder(stationManagerId, order) {
   if (order.deliveryInfo.type !== 'pickup') return false;
   const user = await User.findById(stationManagerId).select('stationId');
@@ -23,13 +22,11 @@ async function canStationManageOrder(stationManagerId, order) {
   return order.deliveryInfo.stationId && order.deliveryInfo.stationId.toString() === user.stationId.toString();
 }
 
-// Helper to get a setting value
 async function getSetting(key) {
   const setting = await Settings.findOne({ key });
   return setting ? setting.value : null;
 }
 
-// Helper to create settlements for all vendors in an order
 async function createSettlementsForOrder(order) {
   const vendorMap = {};
   const categories = await Category.find();
@@ -47,13 +44,11 @@ async function createSettlementsForOrder(order) {
     }
     vendorMap[vendorId].items.push(item);
     vendorMap[vendorId].subtotalUSD += item.priceUSD * item.quantity;
-    // Calculate commission for this item
     const rate = product.commissionOverride !== null ? product.commissionOverride : (categories.find(c => c.name === product.category)?.commission || 5);
     const commissionAmount = item.priceUSD * item.quantity * (rate / 100);
     vendorMap[vendorId].totalCommissionUSD += commissionAmount;
   }
 
-  // Fetch agent and station fees
   const agentFee = await getSetting('agentDeliveryFee') || 0;
   const stationFee = await getSetting('stationPickupFee') || 0;
 
@@ -61,22 +56,17 @@ async function createSettlementsForOrder(order) {
   const agentEarnings = order.assignedAgentId ? agentFee : 0;
   const stationEarnings = isPickup ? stationFee : 0;
 
-  // Create one settlement per vendor
   const settlements = [];
   for (const vendorId in vendorMap) {
     const data = vendorMap[vendorId];
     const vendorEarningsKES = (data.subtotalUSD - data.totalCommissionUSD) * 130;
     const platformCommissionKES = data.totalCommissionUSD * 130;
 
-    // Check if settlement already exists (idempotent)
     let settlement = await Settlement.findOne({
       orderId: order._id,
       vendorId: data.vendorId
     });
-    if (settlement) {
-      // Optional: update existing settlement
-      continue;
-    }
+    if (settlement) continue;
 
     settlement = new Settlement({
       orderId: order._id,
@@ -131,7 +121,6 @@ router.post('/', protect, async (req, res) => {
       idempotencyKey
     } = req.body;
 
-    // Validate discount and deposit values
     if (discountAmountKES !== undefined && discountAmountKES < 0) {
       return res.status(400).json({ error: 'Discount amount cannot be negative' });
     }
@@ -139,7 +128,6 @@ router.post('/', protect, async (req, res) => {
       return res.status(400).json({ error: 'Deposit percentage must be between 0 and 100' });
     }
 
-    // Validate items and quantities
     if (!items || !Array.isArray(items) || items.length === 0) {
       return res.status(400).json({ error: 'At least one item is required' });
     }
@@ -149,7 +137,6 @@ router.post('/', protect, async (req, res) => {
       }
     }
 
-    // Idempotency check
     if (idempotencyKey) {
       const existingOrder = await Order.findOne({
         customerId: req.user._id,
@@ -160,7 +147,6 @@ router.post('/', protect, async (req, res) => {
       }
     }
 
-    // Ensure stationId for pickup orders
     if (deliveryInfo.type === 'pickup' && deliveryInfo.stationName) {
       const station = await PickupStation.findOne({ name: deliveryInfo.stationName });
       if (station) {
@@ -170,7 +156,6 @@ router.post('/', protect, async (req, res) => {
       }
     }
 
-    // Validate stock and calculate totals
     let subtotalUSD = 0;
     let shippingFeeKES = 0;
     const orderItems = [];
@@ -203,7 +188,6 @@ router.post('/', protect, async (req, res) => {
     let balanceDue = 0;
     let paymentStatus = 'pending';
 
-    // === Payment method logic (all cases) ===
     if (paymentMethod === 'card_deposit' || paymentMethod === 'mpesa_deposit' || paymentMethod === 'wallet_deposit') {
       depositPaid = totalKES * (depositPercentage / 100);
       balanceDue = totalKES - depositPaid;
@@ -245,7 +229,6 @@ router.post('/', protect, async (req, res) => {
       idempotencyKey: idempotencyKey || null
     });
 
-    // Deduct stock
     for (const item of items) {
       await Product.updateOne({ _id: item.productId }, { $inc: { stock: -item.quantity } });
     }
@@ -316,7 +299,6 @@ router.put('/:id/status', protect, allowRoles('agent', 'admin', 'owner', 'statio
     const order = await Order.findById(req.params.id);
     if (!order) return res.status(404).json({ error: 'Order not found' });
 
-    // Station manager validation
     if (req.user.role === 'station_manager') {
       const allowed = await canStationManageOrder(req.user._id, order);
       if (!allowed) {
@@ -328,7 +310,6 @@ router.put('/:id/status', protect, allowRoles('agent', 'admin', 'owner', 'statio
     order.updatedAt = Date.now();
     await order.save();
 
-    // If order is delivered and payment is complete, create settlements
     if (deliveryStatus === 'delivered' && (order.paymentStatus === 'fully_paid' || order.paymentStatus === 'cash_collected')) {
       await createSettlementsForOrder(order);
     }
@@ -350,7 +331,6 @@ router.post('/:id/refund', protect, allowRoles('admin', 'owner'), async (req, re
       return res.status(400).json({ error: 'Order not eligible for refund' });
     }
 
-    // Time limit: only allow refunds within 30 days (configurable)
     const REFUND_DAYS_LIMIT = parseInt(process.env.REFUND_DAYS_LIMIT) || 30;
     const now = new Date();
     const orderDate = new Date(order.createdAt);
@@ -359,15 +339,12 @@ router.post('/:id/refund', protect, allowRoles('admin', 'owner'), async (req, re
       return res.status(400).json({ error: `Refund only allowed within ${REFUND_DAYS_LIMIT} days of order creation` });
     }
 
-    // Reverse stock
     for (const item of order.items) {
       await Product.updateOne({ _id: item.productId }, { $inc: { stock: item.quantity } });
     }
 
-    // Process the actual refund (Stripe, wallet, M-Pesa)
     await processRefund(order);
 
-    // Update order
     order.paymentStatus = 'refunded';
     order.deliveryStatus = 'cancelled';
     order.refundReason = reason || 'Refund requested by admin';
@@ -375,10 +352,8 @@ router.post('/:id/refund', protect, allowRoles('admin', 'owner'), async (req, re
     order.refundedAt = new Date();
     await order.save();
 
-    // Remove settlement
     await Settlement.deleteMany({ orderId: order._id });
 
-    // Notify customer
     await Notification.create({
       userId: order.customerId,
       type: 'system',
@@ -403,7 +378,6 @@ router.put('/:id/confirm-cash', protect, allowRoles('agent', 'admin', 'owner', '
       return res.status(400).json({ error: 'Only cash on delivery orders can be confirmed this way' });
     }
 
-    // Station manager validation
     if (req.user.role === 'station_manager') {
       const allowed = await canStationManageOrder(req.user._id, order);
       if (!allowed) {
@@ -415,7 +389,6 @@ router.put('/:id/confirm-cash', protect, allowRoles('agent', 'admin', 'owner', '
     order.updatedAt = Date.now();
     await order.save();
 
-    // If order is delivered and payment is complete, create settlements
     if (order.deliveryStatus === 'delivered' && (order.paymentStatus === 'fully_paid' || order.paymentStatus === 'cash_collected')) {
       await createSettlementsForOrder(order);
     }
@@ -436,7 +409,6 @@ router.put('/:id/record-cash', protect, allowRoles('agent', 'admin', 'owner', 's
     const order = await Order.findById(req.params.id);
     if (!order) return res.status(404).json({ error: 'Order not found' });
 
-    // Station manager validation
     if (req.user.role === 'station_manager') {
       const allowed = await canStationManageOrder(req.user._id, order);
       if (!allowed) {
@@ -444,7 +416,6 @@ router.put('/:id/record-cash', protect, allowRoles('agent', 'admin', 'owner', 's
       }
     }
 
-    // Only allow if there is a remaining balance
     if (!order.remainingBalance || order.remainingBalance <= 0) {
       return res.status(400).json({ error: 'No remaining balance to collect' });
     }
@@ -459,7 +430,6 @@ router.put('/:id/record-cash', protect, allowRoles('agent', 'admin', 'owner', 's
     }
     await order.save();
 
-    // If order is delivered and payment is complete, create settlements
     if (order.deliveryStatus === 'delivered' && (order.paymentStatus === 'fully_paid' || order.paymentStatus === 'cash_collected')) {
       await createSettlementsForOrder(order);
     }
@@ -476,7 +446,6 @@ router.put('/:id/cancel', protect, async (req, res) => {
     const order = await Order.findById(req.params.id);
     if (!order) return res.status(404).json({ error: 'Order not found' });
 
-    // Check permissions
     const isAdmin = ['admin', 'owner'].includes(req.user.role);
     if (!isAdmin && order.customerId.toString() !== req.user._id.toString()) {
       return res.status(403).json({ error: 'Not authorized to cancel this order' });
@@ -494,7 +463,7 @@ router.put('/:id/cancel', protect, async (req, res) => {
   }
 });
 
-// Mark order as fully paid (owner only – bypasses payment)
+// Mark order as fully paid (owner only)
 router.put('/:id/mark-paid', protect, allowRoles('owner'), async (req, res) => {
   try {
     const order = await Order.findById(req.params.id);
@@ -504,6 +473,30 @@ router.put('/:id/mark-paid', protect, allowRoles('owner'), async (req, res) => {
     await order.save();
     res.json({ success: true, order });
   } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ===== 🆕 Record who collected a pickup order =====
+router.put('/:id/collected-by', protect, async (req, res) => {
+  try {
+    const { collectedBy } = req.body;
+    const order = await Order.findById(req.params.id);
+    if (!order) return res.status(404).json({ error: 'Order not found' });
+    if (!['station_manager', 'admin', 'owner'].includes(req.user.role)) {
+      return res.status(403).json({ error: 'Not authorized' });
+    }
+    if (req.user.role === 'station_manager') {
+      const allowed = await canStationManageOrder(req.user._id, order);
+      if (!allowed) {
+        return res.status(403).json({ error: 'You can only record collection for your station' });
+      }
+    }
+    order.collectedBy = collectedBy;
+    await order.save();
+    res.json({ success: true, order });
+  } catch (err) {
+    console.error('Error recording collector info:', err);
     res.status(500).json({ error: err.message });
   }
 });

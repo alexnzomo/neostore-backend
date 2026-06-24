@@ -1,6 +1,6 @@
 const express = require('express');
 const User = require('../models/User');
-const PickupStation = require('../models/PickupStation'); // ✅ ADDED
+const PickupStation = require('../models/PickupStation');
 const { protect } = require('../middleware/auth');
 const { allowRoles } = require('../middleware/roleCheck');
 const { logAction } = require('../utils/audit');
@@ -42,37 +42,76 @@ router.put('/:id/role', protect, allowRoles('owner'), async (req, res) => {
     }
     user.role = role;
     await user.save();
-    await logAction(req, 'role_change', userId, { oldRole: user.role, newRole: role });
+    await logAction(req, 'role_change', user._id, { oldRole: user.role, newRole: role });
     res.json({ message: 'Role updated', user: { id: user._id, role: user.role } });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-// ✅ NEW: Assign station to a user (admin/owner only)
+// Assign station to a station manager (admin/owner only) – with checks
 router.put('/:id/assign-station', protect, allowRoles('admin', 'owner'), async (req, res) => {
   try {
     const { stationId } = req.body;
     const user = await User.findById(req.params.id);
     if (!user) return res.status(404).json({ error: 'User not found' });
-
-    // Optional: Check if the user is a station manager
     if (user.role !== 'station_manager') {
       return res.status(400).json({ error: 'User is not a station manager' });
     }
 
-    // Validate station exists
-    if (stationId) {
-      const station = await PickupStation.findById(stationId);
-      if (!station) return res.status(404).json({ error: 'Station not found' });
+    const station = await PickupStation.findById(stationId);
+    if (!station) return res.status(404).json({ error: 'Station not found' });
+
+    // ✅ Check if the station already has a manager
+    if (station.managerId) {
+      const currentManager = await User.findById(station.managerId);
+      return res.status(400).json({
+        error: `Station already has a manager: ${currentManager?.fullName || 'Unknown user'}. Please unassign them first.`
+      });
     }
 
-    user.stationId = stationId || null;
+    // ✅ Check if the user already manages a station
+    if (user.stationId) {
+      const existingStation = await PickupStation.findById(user.stationId);
+      return res.status(400).json({
+        error: `User already manages station: ${existingStation?.name || 'Unknown station'}. Please unassign them first.`
+      });
+    }
+
+    user.stationId = stationId;
+    station.managerId = user._id;
     await user.save();
-    await logAction(req, 'station_assign', userId, { stationId });
+    await station.save();
+
+    await logAction(req, 'station_assign', user._id, { stationId });
 
     res.json({ success: true, user: { id: user._id, stationId: user.stationId } });
   } catch (err) {
+    console.error('Station assignment error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// 🆕 Unassign a station manager (admin/owner only)
+router.delete('/:stationId/unassign-manager', protect, allowRoles('admin', 'owner'), async (req, res) => {
+  try {
+    const station = await PickupStation.findById(req.params.stationId);
+    if (!station) return res.status(404).json({ error: 'Station not found' });
+    if (!station.managerId) return res.status(400).json({ error: 'Station has no manager' });
+
+    const manager = await User.findById(station.managerId);
+    if (manager) {
+      manager.stationId = null;
+      await manager.save();
+    }
+    station.managerId = null;
+    await station.save();
+
+    await logAction(req, 'station_unassign', manager?._id, { stationId: station._id });
+
+    res.json({ success: true, message: 'Station manager removed' });
+  } catch (err) {
+    console.error('Unassign station manager error:', err);
     res.status(500).json({ error: err.message });
   }
 });
@@ -106,7 +145,7 @@ router.delete('/:id', protect, allowRoles('owner'), async (req, res) => {
   }
 });
 
-// Reset password (public)
+// Reset password (public, after code verification)
 router.post('/reset-password', async (req, res) => {
   const { email, newPassword } = req.body;
   if (!email || !newPassword) {

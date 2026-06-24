@@ -29,12 +29,19 @@ const orderSchema = new mongoose.Schema({
   refundedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null },
   refundedAt: { type: Date, default: null },
   
+  // ===== NEW: Who collected the pickup order =====
+  collectedBy: {
+    name: { type: String, default: null },
+    phone: { type: String, default: null },
+    collectedAt: { type: Date, default: null }
+  },
+
   deliveryInfo: {
     type: { type: String, enum: ['delivery', 'pickup'], required: true },
     address: String,
     city: String,
     county: String,
-    landmark: { type: String, default: null }, // ✅ added landmark (optional)
+    landmark: { type: String, default: null },
     stationId: { type: mongoose.Schema.Types.ObjectId, ref: 'PickupStation' },
     stationName: String
   },
@@ -48,7 +55,6 @@ const orderSchema = new mongoose.Schema({
   deliveryStatus: { type: String, enum: ['pending', 'processing', 'shipped', 'out_for_delivery', 'ready_for_pickup', 'delivered', 'cancelled'], default: 'pending' },
   paymentMethod: { 
     type: String, 
-    // ✅ Added 'wallet' and 'wallet_deposit'
     enum: ['card', 'mpesa', 'cash_on_delivery', 'card_deposit', 'mpesa_deposit', 'wallet', 'wallet_deposit'],
     required: true 
   },

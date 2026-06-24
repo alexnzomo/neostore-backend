@@ -44,12 +44,17 @@ router.put('/:id', protect, allowRoles('admin', 'owner'), async (req, res) => {
   const application = await PickupApplication.findById(req.params.id);
   if (!application) return res.status(404).json({ error: 'Not found' });
   if (application.status !== 'pending') return res.status(400).json({ error: 'Already processed' });
-  application.status = status;
-  application.reviewedBy = req.user._id;
-  application.reviewedAt = new Date();
-  await application.save();
-  // If approved, create a pickup station record
+
   if (status === 'approved') {
+    // 🔴 NEW: Check if the user already manages a station
+    const existingStation = await PickupStation.findOne({ managerId: application.userId });
+    if (existingStation) {
+      return res.status(400).json({
+        error: `User already manages a station: ${existingStation.name}. Please unassign them first.`
+      });
+    }
+
+    // Create the pickup station
     const newStation = new PickupStation({
       name: application.stationName,
       address: application.address,
@@ -58,14 +63,24 @@ router.put('/:id', protect, allowRoles('admin', 'owner'), async (req, res) => {
       phone: application.phone,
       email: application.email || '',
       hours: application.hours || '',
-      managerId: application.userId,   // Link the applicant as station manager
+      managerId: application.userId,
       approvedBy: req.user._id,
       approvedAt: new Date()
     });
     await newStation.save();
-    // Also update the user's stationId
-    await User.findByIdAndUpdate(application.userId, { stationId: newStation._id });
+
+    // Update the user's role and stationId
+    await User.findByIdAndUpdate(application.userId, {
+      role: 'station_manager',
+      stationId: newStation._id
+    });
   }
+
+  application.status = status;
+  application.reviewedBy = req.user._id;
+  application.reviewedAt = new Date();
+  await application.save();
+
   res.json({ message: `Application ${status}` });
 });
 
