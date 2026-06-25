@@ -2,10 +2,8 @@
 const express = require('express');
 const router = express.Router();
 const User = require('../models/User');
+const Otp = require('../models/Otp');          // ✅ Must exist – create models/Otp.js
 const { sendEmail } = require('../utils/email');
-
-// In‑memory OTP store (use Redis in production)
-const otpStore = new Map();
 
 // ========== Helper: normalize email ==========
 function normalizeEmail(email) {
@@ -18,14 +16,24 @@ router.post('/send-verification', async (req, res) => {
   if (!rawEmail) return res.status(400).json({ error: 'Email is required' });
 
   const email = normalizeEmail(rawEmail);
+  console.log(`[send-verification] Received for ${email}`);
 
   // Check if email already registered
   const existing = await User.findOne({ email });
-  if (existing) return res.status(400).json({ error: 'Email already registered' });
+  if (existing) {
+    console.log(`[send-verification] Email already registered: ${email}`);
+    return res.status(400).json({ error: 'Email already registered' });
+  }
 
   const otp = Math.floor(100000 + Math.random() * 900000).toString();
-  const expiresAt = Date.now() + 5 * 60 * 1000; // 5 minutes
-  otpStore.set(email, { otp, expiresAt });
+  const expiresAt = new Date(Date.now() + 5 * 60 * 1000); // 5 minutes
+
+  // Delete any old OTPs for this email
+  await Otp.deleteMany({ email });
+
+  // Save new OTP
+  await Otp.create({ email, otp, expiresAt });
+  console.log(`[send-verification] OTP saved for ${email}: ${otp}, expires at ${expiresAt}`);
 
   try {
     await sendEmail({
@@ -33,9 +41,10 @@ router.post('/send-verification', async (req, res) => {
       subject: 'Your Mwecheche Verification Code',
       html: `<p>Your verification code is: <strong>${otp}</strong></p><p>This code expires in 5 minutes.</p>`
     });
+    console.log(`[send-verification] Email sent to ${email}`);
     res.json({ success: true });
   } catch (err) {
-    console.error('Email send error:', err);
+    console.error(`[send-verification] Email error:`, err.message);
     res.status(500).json({ error: 'Failed to send email: ' + err.message });
   }
 });
@@ -46,20 +55,23 @@ router.post('/verify-and-register', async (req, res) => {
   if (!rawEmail || !code) return res.status(400).json({ error: 'Email and code are required' });
 
   const email = normalizeEmail(rawEmail);
-  const stored = otpStore.get(email);
+  console.log(`[verify-and-register] Received for ${email} with code ${code}`);
 
-  if (!stored) {
-    return res.status(400).json({ error: 'No code sent to this email. Please request a new code.' });
-  }
-  if (Date.now() > stored.expiresAt) {
-    otpStore.delete(email);
-    return res.status(400).json({ error: 'Code expired. Please request a new code.' });
-  }
-  if (stored.otp !== code) {
-    return res.status(400).json({ error: 'Invalid code. Please try again.' });
+  const otpDoc = await Otp.findOne({ email, otp: code });
+  if (!otpDoc) {
+    console.log(`[verify-and-register] OTP not found for ${email} with code ${code}`);
+    return res.status(400).json({ error: 'Invalid or expired code. Please request a new one.' });
   }
 
-  otpStore.delete(email);
+  if (otpDoc.expiresAt < new Date()) {
+    console.log(`[verify-and-register] OTP expired for ${email}`);
+    await Otp.deleteOne({ _id: otpDoc._id });
+    return res.status(400).json({ error: 'Code expired. Please request a new one.' });
+  }
+
+  // Code is valid – delete it so it cannot be reused
+  await Otp.deleteOne({ _id: otpDoc._id });
+  console.log(`[verify-and-register] OTP verified for ${email}`);
   res.json({ success: true });
 });
 
@@ -69,10 +81,11 @@ router.post('/send-verification-generic', async (req, res) => {
   if (!rawEmail) return res.status(400).json({ error: 'Email is required' });
 
   const email = normalizeEmail(rawEmail);
-
   const otp = Math.floor(100000 + Math.random() * 900000).toString();
-  const expiresAt = Date.now() + 5 * 60 * 1000;
-  otpStore.set(email, { otp, expiresAt });
+  const expiresAt = new Date(Date.now() + 5 * 60 * 1000);
+
+  await Otp.deleteMany({ email });
+  await Otp.create({ email, otp, expiresAt });
 
   try {
     await sendEmail({
@@ -82,7 +95,7 @@ router.post('/send-verification-generic', async (req, res) => {
     });
     res.json({ success: true });
   } catch (err) {
-    console.error('Email send error:', err);
+    console.error('Email error:', err);
     res.status(500).json({ error: 'Failed to send email: ' + err.message });
   }
 });
@@ -92,20 +105,17 @@ router.post('/verify-code', async (req, res) => {
   if (!rawEmail || !code) return res.status(400).json({ error: 'Email and code are required' });
 
   const email = normalizeEmail(rawEmail);
-  const stored = otpStore.get(email);
+  const otpDoc = await Otp.findOne({ email, otp: code });
 
-  if (!stored) {
-    return res.status(400).json({ error: 'No code sent. Please request a new code.' });
+  if (!otpDoc) {
+    return res.status(400).json({ error: 'Invalid or expired code.' });
   }
-  if (Date.now() > stored.expiresAt) {
-    otpStore.delete(email);
-    return res.status(400).json({ error: 'Code expired. Please request a new code.' });
-  }
-  if (stored.otp !== code) {
-    return res.status(400).json({ error: 'Invalid code. Please try again.' });
+  if (otpDoc.expiresAt < new Date()) {
+    await Otp.deleteOne({ _id: otpDoc._id });
+    return res.status(400).json({ error: 'Code expired. Please request a new one.' });
   }
 
-  otpStore.delete(email);
+  await Otp.deleteOne({ _id: otpDoc._id });
   res.json({ success: true });
 });
 
@@ -119,8 +129,10 @@ router.post('/send-reset-code', async (req, res) => {
   if (!user) return res.status(404).json({ error: 'User not found' });
 
   const otp = Math.floor(100000 + Math.random() * 900000).toString();
-  const expiresAt = Date.now() + 5 * 60 * 1000;
-  otpStore.set(`reset-${email}`, { otp, expiresAt });
+  const expiresAt = new Date(Date.now() + 5 * 60 * 1000);
+
+  await Otp.deleteMany({ email });
+  await Otp.create({ email, otp, expiresAt });
 
   try {
     await sendEmail({
@@ -130,7 +142,7 @@ router.post('/send-reset-code', async (req, res) => {
     });
     res.json({ success: true });
   } catch (err) {
-    console.error('Email send error:', err);
+    console.error('Email error:', err);
     res.status(500).json({ error: 'Failed to send email: ' + err.message });
   }
 });
@@ -140,20 +152,17 @@ router.post('/verify-reset-code', async (req, res) => {
   if (!rawEmail || !code) return res.status(400).json({ error: 'Email and code are required' });
 
   const email = normalizeEmail(rawEmail);
-  const stored = otpStore.get(`reset-${email}`);
+  const otpDoc = await Otp.findOne({ email, otp: code });
 
-  if (!stored) {
-    return res.status(400).json({ error: 'No code sent. Please request a new code.' });
+  if (!otpDoc) {
+    return res.status(400).json({ error: 'Invalid or expired code.' });
   }
-  if (Date.now() > stored.expiresAt) {
-    otpStore.delete(`reset-${email}`);
-    return res.status(400).json({ error: 'Code expired. Please request a new code.' });
-  }
-  if (stored.otp !== code) {
-    return res.status(400).json({ error: 'Invalid code. Please try again.' });
+  if (otpDoc.expiresAt < new Date()) {
+    await Otp.deleteOne({ _id: otpDoc._id });
+    return res.status(400).json({ error: 'Code expired. Please request a new one.' });
   }
 
-  otpStore.delete(`reset-${email}`);
+  await Otp.deleteOne({ _id: otpDoc._id });
   res.json({ success: true });
 });
 
