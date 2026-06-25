@@ -1,3 +1,4 @@
+// routes/orders.js
 const express = require('express');
 const Order = require('../models/Order');
 const Product = require('../models/Product');
@@ -10,6 +11,10 @@ const Category = require('../models/Category');
 const Settings = require('../models/Settings');
 const Notification = require('../models/Notification');
 const { cancelOrder, processRefund } = require('../utils/orderUtils');
+const { createNotification } = require('../utils/notifications');
+const { logAction } = require('../utils/audit');
+const { sanitizeBody } = require('../middleware/sanitize');
+const { body, validationResult } = require('express-validator');
 
 const router = express.Router();
 
@@ -109,137 +114,164 @@ router.get('/', protect, allowRoles('admin', 'owner', 'station_manager'), async 
 });
 
 // Create order (checkout) – protected
-router.post('/', protect, async (req, res) => {
-  try {
-    const {
-      items,
-      deliveryInfo,
-      paymentMethod,
-      depositPercentage,
-      discountCode,
-      discountAmountKES,
-      idempotencyKey
-    } = req.body;
-
-    if (discountAmountKES !== undefined && discountAmountKES < 0) {
-      return res.status(400).json({ error: 'Discount amount cannot be negative' });
-    }
-    if (depositPercentage !== undefined && (depositPercentage < 0 || depositPercentage > 100)) {
-      return res.status(400).json({ error: 'Deposit percentage must be between 0 and 100' });
-    }
-
-    if (!items || !Array.isArray(items) || items.length === 0) {
-      return res.status(400).json({ error: 'At least one item is required' });
-    }
-    for (const item of items) {
-      if (!item.productId || !item.quantity || item.quantity <= 0) {
-        return res.status(400).json({ error: 'Each item must have a valid product ID and positive quantity' });
-      }
+router.post(
+  '/',
+  protect,
+  sanitizeBody(['customerPhone']),
+  [
+    body('items').isArray({ min: 1 }).withMessage('At least one item required'),
+    body('items.*.productId').isMongoId().withMessage('Invalid product ID'),
+    body('items.*.quantity').isInt({ min: 1 }).withMessage('Quantity must be positive'),
+    body('deliveryInfo.type').isIn(['delivery', 'pickup']).withMessage('Invalid delivery type'),
+    body('paymentMethod').isIn([
+      'card', 'mpesa', 'cash_on_delivery',
+      'card_deposit', 'mpesa_deposit', 'wallet', 'wallet_deposit'
+    ]).withMessage('Invalid payment method'),
+    body('depositPercentage').optional().isFloat({ min: 0, max: 100 }).withMessage('Deposit must be 0-100'),
+    body('discountAmountKES').optional().isFloat({ min: 0 }).withMessage('Discount must be non‑negative'),
+    body('customerPhone').trim().notEmpty().withMessage('Phone required'),
+  ],
+  async (req, res) => {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({ errors: errors.array() });
     }
 
-    if (idempotencyKey) {
-      const existingOrder = await Order.findOne({
-        customerId: req.user._id,
+    try {
+      const {
+        items,
+        deliveryInfo,
+        paymentMethod,
+        depositPercentage,
+        discountCode,
+        discountAmountKES,
         idempotencyKey
-      });
-      if (existingOrder) {
-        return res.status(409).json({ error: 'Duplicate order attempt' });
-      }
-    }
+      } = req.body;
 
-    if (deliveryInfo.type === 'pickup' && deliveryInfo.stationName) {
-      const station = await PickupStation.findOne({ name: deliveryInfo.stationName });
-      if (station) {
-        deliveryInfo.stationId = station._id;
+      if (discountAmountKES !== undefined && discountAmountKES < 0) {
+        return res.status(400).json({ error: 'Discount amount cannot be negative' });
+      }
+      if (depositPercentage !== undefined && (depositPercentage < 0 || depositPercentage > 100)) {
+        return res.status(400).json({ error: 'Deposit percentage must be between 0 and 100' });
+      }
+
+      // Validate items
+      for (const item of items) {
+        if (!item.productId || !item.quantity || item.quantity <= 0) {
+          return res.status(400).json({ error: 'Each item must have a valid product ID and positive quantity' });
+        }
+      }
+
+      // Idempotency check
+      if (idempotencyKey) {
+        const existingOrder = await Order.findOne({
+          customerId: req.user._id,
+          idempotencyKey
+        });
+        if (existingOrder) {
+          return res.status(409).json({ error: 'Duplicate order attempt' });
+        }
+      }
+
+      // Resolve pickup station
+      if (deliveryInfo.type === 'pickup' && deliveryInfo.stationName) {
+        const station = await PickupStation.findOne({ name: deliveryInfo.stationName });
+        if (station) {
+          deliveryInfo.stationId = station._id;
+        } else {
+          return res.status(400).json({ error: 'Pickup station not found' });
+        }
+      }
+
+      // Calculate totals
+      let subtotalUSD = 0;
+      let shippingFeeKES = 0;
+      const orderItems = [];
+
+      for (const item of items) {
+        const product = await Product.findById(item.productId);
+        if (!product) return res.status(400).json({ error: `Product ${item.productId} not found` });
+        if (product.stock < item.quantity) {
+          return res.status(400).json({ error: `Insufficient stock for ${product.name}` });
+        }
+        const effectivePrice = product.salePrice && product.salePrice < product.price ? product.salePrice : product.price;
+        if (effectivePrice < 0) {
+          return res.status(400).json({ error: `Product ${product.name} has an invalid price` });
+        }
+        subtotalUSD += effectivePrice * item.quantity;
+        shippingFeeKES += (product.shippingFee || 100) * item.quantity;
+        orderItems.push({
+          productId: product._id,
+          name: product.name,
+          priceUSD: effectivePrice,
+          quantity: item.quantity
+        });
+      }
+
+      const subtotalKES = subtotalUSD * 130;
+      let totalKES = subtotalKES - (discountAmountKES || 0) + shippingFeeKES;
+      if (totalKES < 0) totalKES = 0;
+
+      let depositPaid = 0;
+      let balanceDue = 0;
+      let paymentStatus = 'pending';
+
+      if (paymentMethod === 'card_deposit' || paymentMethod === 'mpesa_deposit' || paymentMethod === 'wallet_deposit') {
+        depositPaid = totalKES * (depositPercentage / 100);
+        balanceDue = totalKES - depositPaid;
+        paymentStatus = 'deposit_paid';
+      } else if (paymentMethod === 'card' || paymentMethod === 'mpesa' || paymentMethod === 'wallet') {
+        depositPaid = totalKES;
+        balanceDue = 0;
+        paymentStatus = 'fully_paid';
+      } else if (paymentMethod === 'cash_on_delivery') {
+        depositPaid = 0;
+        balanceDue = totalKES;
+        paymentStatus = 'pending';
       } else {
-        return res.status(400).json({ error: 'Pickup station not found' });
+        return res.status(400).json({ error: 'Invalid payment method' });
       }
-    }
 
-    let subtotalUSD = 0;
-    let shippingFeeKES = 0;
-    const orderItems = [];
-
-    for (const item of items) {
-      const product = await Product.findById(item.productId);
-      if (!product) return res.status(400).json({ error: `Product ${item.productId} not found` });
-      if (product.stock < item.quantity) {
-        return res.status(400).json({ error: `Insufficient stock for ${product.name}` });
-      }
-      const effectivePrice = product.salePrice && product.salePrice < product.price ? product.salePrice : product.price;
-      if (effectivePrice < 0) {
-        return res.status(400).json({ error: `Product ${product.name} has an invalid price` });
-      }
-      subtotalUSD += effectivePrice * item.quantity;
-      shippingFeeKES += (product.shippingFee || 100) * item.quantity;
-      orderItems.push({
-        productId: product._id,
-        name: product.name,
-        priceUSD: effectivePrice,
-        quantity: item.quantity
+      const orderId = await Order.getNextOrderId();
+      const newOrder = new Order({
+        orderId,
+        customerId: req.user._id,
+        customerName: req.user.fullName,
+        customerEmail: req.user.email,
+        customerPhone: req.body.customerPhone,
+        deliveryInfo,
+        items: orderItems,
+        subtotalUSD,
+        discountAmountKES: discountAmountKES || 0,
+        discountCode: discountCode || null,
+        shippingFeeKES,
+        totalKES,
+        paymentStatus,
+        deliveryStatus: 'pending',
+        paymentMethod,
+        depositPaid,
+        balanceDue,
+        assignedAgentId: null,
+        cashCollected: 0,
+        remainingBalance: balanceDue,
+        idempotencyKey: idempotencyKey || null
       });
+
+      // Deduct stock
+      for (const item of items) {
+        await Product.updateOne({ _id: item.productId }, { $inc: { stock: -item.quantity } });
+      }
+
+      await newOrder.save();
+      await logAction(req, 'order_created', req.user._id, { orderId: newOrder._id, total: totalKES });
+
+      res.status(201).json(newOrder);
+    } catch (err) {
+      console.error(err);
+      res.status(500).json({ error: err.message });
     }
-
-    const subtotalKES = subtotalUSD * 130;
-    let totalKES = subtotalKES - (discountAmountKES || 0) + shippingFeeKES;
-    if (totalKES < 0) totalKES = 0;
-
-    let depositPaid = 0;
-    let balanceDue = 0;
-    let paymentStatus = 'pending';
-
-    if (paymentMethod === 'card_deposit' || paymentMethod === 'mpesa_deposit' || paymentMethod === 'wallet_deposit') {
-      depositPaid = totalKES * (depositPercentage / 100);
-      balanceDue = totalKES - depositPaid;
-      paymentStatus = 'deposit_paid';
-    } else if (paymentMethod === 'card' || paymentMethod === 'mpesa' || paymentMethod === 'wallet') {
-      depositPaid = totalKES;
-      balanceDue = 0;
-      paymentStatus = 'fully_paid';
-    } else if (paymentMethod === 'cash_on_delivery') {
-      depositPaid = 0;
-      balanceDue = totalKES;
-      paymentStatus = 'pending';
-    } else {
-      return res.status(400).json({ error: 'Invalid payment method' });
-    }
-
-    const orderId = await Order.getNextOrderId();
-    const newOrder = new Order({
-      orderId,
-      customerId: req.user._id,
-      customerName: req.user.fullName,
-      customerEmail: req.user.email,
-      customerPhone: req.body.customerPhone,
-      deliveryInfo,
-      items: orderItems,
-      subtotalUSD,
-      discountAmountKES: discountAmountKES || 0,
-      discountCode: discountCode || null,
-      shippingFeeKES,
-      totalKES,
-      paymentStatus,
-      deliveryStatus: 'pending',
-      paymentMethod,
-      depositPaid,
-      balanceDue,
-      assignedAgentId: null,
-      cashCollected: 0,
-      remainingBalance: balanceDue,
-      idempotencyKey: idempotencyKey || null
-    });
-
-    for (const item of items) {
-      await Product.updateOne({ _id: item.productId }, { $inc: { stock: -item.quantity } });
-    }
-
-    await newOrder.save();
-    res.status(201).json(newOrder);
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: err.message });
   }
-});
+);
 
 // Get current user's orders
 router.get('/my', protect, async (req, res) => {
@@ -252,31 +284,69 @@ router.get('/my', protect, async (req, res) => {
 });
 
 // Assign agent to order (admin/owner only)
-router.put('/:id/assign-agent', protect, allowRoles('admin', 'owner'), async (req, res) => {
-  const { agentId } = req.body;
-  const order = await Order.findById(req.params.id);
-  if (!order) return res.status(404).json({ error: 'Order not found' });
-  order.assignedAgentId = agentId || null;
-  await order.save();
-  res.json(order);
-});
+router.put(
+  '/:id/assign-agent',
+  protect,
+  allowRoles('admin', 'owner'),
+  sanitizeBody(['agentId']),
+  [
+    body('agentId').optional().isMongoId().withMessage('Invalid agent ID'),
+  ],
+  async (req, res) => {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({ errors: errors.array() });
+    }
+
+    try {
+      const { agentId } = req.body;
+      const order = await Order.findById(req.params.id);
+      if (!order) return res.status(404).json({ error: 'Order not found' });
+      order.assignedAgentId = agentId || null;
+      await order.save();
+
+      await logAction(req, 'assign_agent', order.customerId, { orderId: order._id, agentId });
+
+      res.json(order);
+    } catch (err) {
+      res.status(500).json({ error: err.message });
+    }
+  }
+);
 
 // Assign station to order (admin/owner only)
-router.put('/:id/assign-station', protect, allowRoles('admin', 'owner'), async (req, res) => {
-  try {
-    const { stationId } = req.body;
-    const order = await Order.findById(req.params.id);
-    if (!order) return res.status(404).json({ error: 'Order not found' });
-    const station = await PickupStation.findById(stationId);
-    if (!station) return res.status(404).json({ error: 'Station not found' });
-    order.deliveryInfo.stationId = stationId;
-    order.deliveryInfo.stationName = station.name;
-    await order.save();
-    res.json(order);
-  } catch (err) {
-    res.status(500).json({ error: err.message });
+router.put(
+  '/:id/assign-station',
+  protect,
+  allowRoles('admin', 'owner'),
+  sanitizeBody(['stationId']),
+  [
+    body('stationId').isMongoId().withMessage('Invalid station ID'),
+  ],
+  async (req, res) => {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({ errors: errors.array() });
+    }
+
+    try {
+      const { stationId } = req.body;
+      const order = await Order.findById(req.params.id);
+      if (!order) return res.status(404).json({ error: 'Order not found' });
+      const station = await PickupStation.findById(stationId);
+      if (!station) return res.status(404).json({ error: 'Station not found' });
+      order.deliveryInfo.stationId = stationId;
+      order.deliveryInfo.stationName = station.name;
+      await order.save();
+
+      await logAction(req, 'assign_order_station', order.customerId, { orderId: order._id, stationId });
+
+      res.json(order);
+    } catch (err) {
+      res.status(500).json({ error: err.message });
+    }
   }
-});
+);
 
 // Get single order
 router.get('/:id', protect, async (req, res) => {
@@ -293,212 +363,329 @@ router.get('/:id', protect, async (req, res) => {
 });
 
 // Update delivery status (agent/admin/owner/station_manager) – creates settlements on delivery + payment
-router.put('/:id/status', protect, allowRoles('agent', 'admin', 'owner', 'station_manager'), async (req, res) => {
-  try {
-    const { deliveryStatus } = req.body;
-    const order = await Order.findById(req.params.id);
-    if (!order) return res.status(404).json({ error: 'Order not found' });
+router.put(
+  '/:id/status',
+  protect,
+  allowRoles('agent', 'admin', 'owner', 'station_manager'),
+  sanitizeBody(['deliveryStatus']),
+  [
+    body('deliveryStatus')
+      .isIn(['pending', 'processing', 'shipped', 'out_for_delivery', 'ready_for_pickup', 'delivered', 'cancelled'])
+      .withMessage('Invalid delivery status'),
+  ],
+  async (req, res) => {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({ errors: errors.array() });
+    }
 
-    if (req.user.role === 'station_manager') {
-      const allowed = await canStationManageOrder(req.user._id, order);
-      if (!allowed) {
-        return res.status(403).json({ error: 'You can only update pickup orders for your station' });
+    try {
+      const { deliveryStatus } = req.body;
+      const order = await Order.findById(req.params.id);
+      if (!order) return res.status(404).json({ error: 'Order not found' });
+
+      if (req.user.role === 'station_manager') {
+        const allowed = await canStationManageOrder(req.user._id, order);
+        if (!allowed) {
+          return res.status(403).json({ error: 'You can only update pickup orders for your station' });
+        }
       }
+
+      order.deliveryStatus = deliveryStatus;
+      order.updatedAt = Date.now();
+      await order.save();
+
+      await logAction(req, 'order_status_update', order.customerId, { orderId: order._id, newStatus: deliveryStatus });
+
+      if (deliveryStatus === 'delivered' && (order.paymentStatus === 'fully_paid' || order.paymentStatus === 'cash_collected')) {
+        await createSettlementsForOrder(order);
+      }
+
+      res.json(order);
+    } catch (err) {
+      res.status(500).json({ error: err.message });
     }
-
-    order.deliveryStatus = deliveryStatus;
-    order.updatedAt = Date.now();
-    await order.save();
-
-    if (deliveryStatus === 'delivered' && (order.paymentStatus === 'fully_paid' || order.paymentStatus === 'cash_collected')) {
-      await createSettlementsForOrder(order);
-    }
-
-    res.json(order);
-  } catch (err) {
-    res.status(500).json({ error: err.message });
   }
-});
+);
 
 // Refund an order (admin/owner only)
-router.post('/:id/refund', protect, allowRoles('admin', 'owner'), async (req, res) => {
-  try {
-    const { reason } = req.body;
-    const order = await Order.findById(req.params.id);
-    if (!order) return res.status(404).json({ error: 'Order not found' });
-    if (order.paymentStatus === 'refunded') return res.status(400).json({ error: 'Already refunded' });
-    if (!['fully_paid', 'cash_collected', 'deposit_paid'].includes(order.paymentStatus)) {
-      return res.status(400).json({ error: 'Order not eligible for refund' });
+router.post(
+  '/:id/refund',
+  protect,
+  allowRoles('admin', 'owner'),
+  sanitizeBody(['reason']),
+  [
+    body('reason').optional().trim().isLength({ max: 500 }),
+  ],
+  async (req, res) => {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({ errors: errors.array() });
     }
 
-    const REFUND_DAYS_LIMIT = parseInt(process.env.REFUND_DAYS_LIMIT) || 30;
-    const now = new Date();
-    const orderDate = new Date(order.createdAt);
-    const daysDiff = (now - orderDate) / (1000 * 60 * 60 * 24);
-    if (daysDiff > REFUND_DAYS_LIMIT) {
-      return res.status(400).json({ error: `Refund only allowed within ${REFUND_DAYS_LIMIT} days of order creation` });
+    try {
+      const { reason } = req.body;
+      const order = await Order.findById(req.params.id);
+      if (!order) return res.status(404).json({ error: 'Order not found' });
+      if (order.paymentStatus === 'refunded') return res.status(400).json({ error: 'Already refunded' });
+      if (!['fully_paid', 'cash_collected', 'deposit_paid'].includes(order.paymentStatus)) {
+        return res.status(400).json({ error: 'Order not eligible for refund' });
+      }
+
+      const REFUND_DAYS_LIMIT = parseInt(process.env.REFUND_DAYS_LIMIT) || 30;
+      const now = new Date();
+      const orderDate = new Date(order.createdAt);
+      const daysDiff = (now - orderDate) / (1000 * 60 * 60 * 24);
+      if (daysDiff > REFUND_DAYS_LIMIT) {
+        return res.status(400).json({ error: `Refund only allowed within ${REFUND_DAYS_LIMIT} days of order creation` });
+      }
+
+      for (const item of order.items) {
+        await Product.updateOne({ _id: item.productId }, { $inc: { stock: item.quantity } });
+      }
+
+      await processRefund(order);
+
+      order.paymentStatus = 'refunded';
+      order.deliveryStatus = 'cancelled';
+      order.refundReason = reason || 'Refund requested by admin';
+      order.refundedBy = req.user._id;
+      order.refundedAt = new Date();
+      await order.save();
+
+      await Settlement.deleteMany({ orderId: order._id });
+
+      // Notify customer
+      await createNotification(
+        order.customerId,
+        'system',
+        'Refund processed',
+        `Your order #${order.orderId} has been refunded. Reason: ${order.refundReason}`,
+        '/account.html'
+      );
+
+      await logAction(req, 'order_refund', order.customerId, { orderId: order._id, amount: order.totalKES });
+
+      res.json({ success: true, order });
+    } catch (err) {
+      console.error('Refund error:', err);
+      res.status(500).json({ error: err.message });
     }
-
-    for (const item of order.items) {
-      await Product.updateOne({ _id: item.productId }, { $inc: { stock: item.quantity } });
-    }
-
-    await processRefund(order);
-
-    order.paymentStatus = 'refunded';
-    order.deliveryStatus = 'cancelled';
-    order.refundReason = reason || 'Refund requested by admin';
-    order.refundedBy = req.user._id;
-    order.refundedAt = new Date();
-    await order.save();
-
-    await Settlement.deleteMany({ orderId: order._id });
-
-    await Notification.create({
-      userId: order.customerId,
-      type: 'system',
-      title: 'Refund processed',
-      message: `Your order #${order.orderId} has been refunded. Reason: ${order.refundReason}`,
-      link: `/account.html`
-    });
-
-    res.json({ success: true, order });
-  } catch (err) {
-    console.error('Refund error:', err);
-    res.status(500).json({ error: err.message });
   }
-});
+);
 
 // Legacy confirm cash (marks entire order as cash_collected)
-router.put('/:id/confirm-cash', protect, allowRoles('agent', 'admin', 'owner', 'station_manager'), async (req, res) => {
-  try {
-    const order = await Order.findById(req.params.id);
-    if (!order) return res.status(404).json({ error: 'Order not found' });
-    if (order.paymentMethod !== 'cash_on_delivery') {
-      return res.status(400).json({ error: 'Only cash on delivery orders can be confirmed this way' });
-    }
-
-    if (req.user.role === 'station_manager') {
-      const allowed = await canStationManageOrder(req.user._id, order);
-      if (!allowed) {
-        return res.status(403).json({ error: 'You can only manage pickup orders for your station' });
+router.put(
+  '/:id/confirm-cash',
+  protect,
+  allowRoles('agent', 'admin', 'owner', 'station_manager'),
+  async (req, res) => {
+    try {
+      const order = await Order.findById(req.params.id);
+      if (!order) return res.status(404).json({ error: 'Order not found' });
+      if (order.paymentMethod !== 'cash_on_delivery') {
+        return res.status(400).json({ error: 'Only cash on delivery orders can be confirmed this way' });
       }
+
+      if (req.user.role === 'station_manager') {
+        const allowed = await canStationManageOrder(req.user._id, order);
+        if (!allowed) {
+          return res.status(403).json({ error: 'You can only manage pickup orders for your station' });
+        }
+      }
+
+      order.paymentStatus = 'cash_collected';
+      order.updatedAt = Date.now();
+      await order.save();
+
+      await logAction(req, 'confirm_cash', order.customerId, { orderId: order._id });
+
+      if (order.deliveryStatus === 'delivered' && (order.paymentStatus === 'fully_paid' || order.paymentStatus === 'cash_collected')) {
+        await createSettlementsForOrder(order);
+      }
+
+      res.json(order);
+    } catch (err) {
+      res.status(500).json({ error: err.message });
     }
-
-    order.paymentStatus = 'cash_collected';
-    order.updatedAt = Date.now();
-    await order.save();
-
-    if (order.deliveryStatus === 'delivered' && (order.paymentStatus === 'fully_paid' || order.paymentStatus === 'cash_collected')) {
-      await createSettlementsForOrder(order);
-    }
-
-    res.json(order);
-  } catch (err) {
-    res.status(500).json({ error: err.message });
   }
-});
+);
 
 // Record cash payment (partial/full) – agent/admin/owner/station_manager
-router.put('/:id/record-cash', protect, allowRoles('agent', 'admin', 'owner', 'station_manager'), async (req, res) => {
-  try {
-    const { amount } = req.body;
-    if (!amount || amount <= 0) {
-      return res.status(400).json({ error: 'Amount must be positive' });
+router.put(
+  '/:id/record-cash',
+  protect,
+  allowRoles('agent', 'admin', 'owner', 'station_manager'),
+  sanitizeBody(['amount']),
+  [
+    body('amount').isFloat({ min: 1 }).withMessage('Amount must be positive'),
+  ],
+  async (req, res) => {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({ errors: errors.array() });
     }
-    const order = await Order.findById(req.params.id);
-    if (!order) return res.status(404).json({ error: 'Order not found' });
 
-    if (req.user.role === 'station_manager') {
-      const allowed = await canStationManageOrder(req.user._id, order);
-      if (!allowed) {
-        return res.status(403).json({ error: 'You can only manage pickup orders for your station' });
+    try {
+      const { amount } = req.body;
+      const order = await Order.findById(req.params.id);
+      if (!order) return res.status(404).json({ error: 'Order not found' });
+
+      if (req.user.role === 'station_manager') {
+        const allowed = await canStationManageOrder(req.user._id, order);
+        if (!allowed) {
+          return res.status(403).json({ error: 'You can only manage pickup orders for your station' });
+        }
       }
-    }
 
-    if (!order.remainingBalance || order.remainingBalance <= 0) {
-      return res.status(400).json({ error: 'No remaining balance to collect' });
-    }
-    if (amount > order.remainingBalance) {
-      return res.status(400).json({ error: 'Amount exceeds remaining balance' });
-    }
+      if (!order.remainingBalance || order.remainingBalance <= 0) {
+        return res.status(400).json({ error: 'No remaining balance to collect' });
+      }
+      if (amount > order.remainingBalance) {
+        return res.status(400).json({ error: 'Amount exceeds remaining balance' });
+      }
 
-    order.cashCollected += amount;
-    order.remainingBalance -= amount;
-    if (order.remainingBalance === 0) {
-      order.paymentStatus = 'fully_paid';
-    }
-    await order.save();
+      order.cashCollected += amount;
+      order.remainingBalance -= amount;
+      if (order.remainingBalance === 0) {
+        order.paymentStatus = 'fully_paid';
+      }
+      await order.save();
 
-    if (order.deliveryStatus === 'delivered' && (order.paymentStatus === 'fully_paid' || order.paymentStatus === 'cash_collected')) {
-      await createSettlementsForOrder(order);
-    }
+      await logAction(req, 'record_cash', order.customerId, { orderId: order._id, amount, newRemaining: order.remainingBalance });
 
-    res.json({ success: true, cashCollected: order.cashCollected, remainingBalance: order.remainingBalance, paymentStatus: order.paymentStatus });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
+      if (order.deliveryStatus === 'delivered' && (order.paymentStatus === 'fully_paid' || order.paymentStatus === 'cash_collected')) {
+        await createSettlementsForOrder(order);
+      }
+
+      res.json({ success: true, cashCollected: order.cashCollected, remainingBalance: order.remainingBalance, paymentStatus: order.paymentStatus });
+    } catch (err) {
+      res.status(500).json({ error: err.message });
+    }
   }
-});
+);
 
 // Cancel order (customer, admin, owner)
-router.put('/:id/cancel', protect, async (req, res) => {
-  try {
-    const order = await Order.findById(req.params.id);
-    if (!order) return res.status(404).json({ error: 'Order not found' });
-
-    const isAdmin = ['admin', 'owner'].includes(req.user.role);
-    if (!isAdmin && order.customerId.toString() !== req.user._id.toString()) {
-      return res.status(403).json({ error: 'Not authorized to cancel this order' });
+router.put(
+  '/:id/cancel',
+  protect,
+  sanitizeBody(['reason']),
+  [
+    body('reason').optional().trim().isLength({ max: 500 }),
+  ],
+  async (req, res) => {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({ errors: errors.array() });
     }
 
-    const { reason } = req.body;
-    const cancelledOrder = await cancelOrder(
-      order._id,
-      reason || 'Order cancelled',
-      req.user._id
-    );
-    res.json({ success: true, order: cancelledOrder });
-  } catch (err) {
-    res.status(400).json({ error: err.message });
+    try {
+      const order = await Order.findById(req.params.id);
+      if (!order) return res.status(404).json({ error: 'Order not found' });
+
+      const isAdmin = ['admin', 'owner'].includes(req.user.role);
+      if (!isAdmin && order.customerId.toString() !== req.user._id.toString()) {
+        return res.status(403).json({ error: 'Not authorized to cancel this order' });
+      }
+
+      const { reason } = req.body;
+      const cancelledOrder = await cancelOrder(
+        order._id,
+        reason || 'Order cancelled',
+        req.user._id
+      );
+
+      // Notify customer
+      await createNotification(
+        order.customerId,
+        'system',
+        'Order Cancelled',
+        `Your order #${order.orderId} has been cancelled. Reason: ${cancelledOrder.cancellationReason || 'No reason provided'}`,
+        '/account.html'
+      );
+
+      // Notify admins/owners
+      const admins = await User.find({ role: { $in: ['admin', 'owner'] } });
+      for (const admin of admins) {
+        await createNotification(
+          admin._id,
+          'system',
+          'Order Cancelled by Customer',
+          `Order #${order.orderId} was cancelled by ${req.user.fullName} (${req.user.email}). Reason: ${cancelledOrder.cancellationReason || 'N/A'}`,
+          '/admin.html?tab=orders'
+        );
+      }
+
+      await logAction(req, 'order_cancel', order.customerId, { orderId: order._id, reason });
+
+      res.json({ success: true, order: cancelledOrder });
+    } catch (err) {
+      res.status(400).json({ error: err.message });
+    }
   }
-});
+);
 
 // Mark order as fully paid (owner only)
-router.put('/:id/mark-paid', protect, allowRoles('owner'), async (req, res) => {
-  try {
-    const order = await Order.findById(req.params.id);
-    if (!order) return res.status(404).json({ error: 'Order not found' });
-    order.paymentStatus = 'fully_paid';
-    order.updatedAt = Date.now();
-    await order.save();
-    res.json({ success: true, order });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
+router.put(
+  '/:id/mark-paid',
+  protect,
+  allowRoles('owner'),
+  async (req, res) => {
+    try {
+      const order = await Order.findById(req.params.id);
+      if (!order) return res.status(404).json({ error: 'Order not found' });
+      order.paymentStatus = 'fully_paid';
+      order.updatedAt = Date.now();
+      await order.save();
 
-// ===== 🆕 Record who collected a pickup order =====
-router.put('/:id/collected-by', protect, async (req, res) => {
-  try {
-    const { collectedBy } = req.body;
-    const order = await Order.findById(req.params.id);
-    if (!order) return res.status(404).json({ error: 'Order not found' });
-    if (!['station_manager', 'admin', 'owner'].includes(req.user.role)) {
-      return res.status(403).json({ error: 'Not authorized' });
+      await logAction(req, 'mark_paid', order.customerId, { orderId: order._id });
+
+      res.json({ success: true, order });
+    } catch (err) {
+      res.status(500).json({ error: err.message });
     }
-    if (req.user.role === 'station_manager') {
-      const allowed = await canStationManageOrder(req.user._id, order);
-      if (!allowed) {
-        return res.status(403).json({ error: 'You can only record collection for your station' });
-      }
-    }
-    order.collectedBy = collectedBy;
-    await order.save();
-    res.json({ success: true, order });
-  } catch (err) {
-    console.error('Error recording collector info:', err);
-    res.status(500).json({ error: err.message });
   }
-});
+);
+
+// Record who collected a pickup order
+router.put(
+  '/:id/collected-by',
+  protect,
+  sanitizeBody(['collectedBy.name', 'collectedBy.phone']),
+  [
+    body('collectedBy.name').optional().trim().isLength({ max: 100 }),
+    body('collectedBy.phone').optional().trim().isLength({ max: 20 }),
+  ],
+  async (req, res) => {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({ errors: errors.array() });
+    }
+
+    try {
+      const { collectedBy } = req.body;
+      const order = await Order.findById(req.params.id);
+      if (!order) return res.status(404).json({ error: 'Order not found' });
+      if (!['station_manager', 'admin', 'owner'].includes(req.user.role)) {
+        return res.status(403).json({ error: 'Not authorized' });
+      }
+      if (req.user.role === 'station_manager') {
+        const allowed = await canStationManageOrder(req.user._id, order);
+        if (!allowed) {
+          return res.status(403).json({ error: 'You can only record collection for your station' });
+        }
+      }
+      order.collectedBy = collectedBy;
+      await order.save();
+
+      await logAction(req, 'record_collection', order.customerId, { orderId: order._id, collectedBy });
+
+      res.json({ success: true, order });
+    } catch (err) {
+      console.error('Error recording collector info:', err);
+      res.status(500).json({ error: err.message });
+    }
+  }
+);
 
 module.exports = router;

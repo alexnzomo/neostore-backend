@@ -13,6 +13,10 @@ exports.protect = async (req, res, next) => {
     if (!user) {
       return res.status(401).json({ error: 'User not found' });
     }
+    // ✅ Suspension check
+    if (user.isSuspended) {
+      return res.status(403).json({ error: 'Account suspended' });
+    }
     req.user = user;
     next();
   } catch (err) {

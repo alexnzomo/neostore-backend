@@ -17,6 +17,9 @@ const User = require('./models/User');
 const Order = require('./models/Order');
 const Product = require('./models/Product');
 const TopUpRequest = require('./models/TopUpRequest');
+const PickupStation = require('./models/PickupStation');
+const Settlement = require('./models/Settlement');
+const Withdrawal = require('./models/Withdrawal');
 
 // ========== Services ==========
 const WalletService = require('./services/walletService');
@@ -43,20 +46,55 @@ const withdrawalRoutes = require('./routes/withdrawals');
 const notificationRoutes = require('./routes/notifications');
 const auditRoutes = require('./routes/audit');
 const reportRoutes = require('./routes/reports');
+const verificationRoutes = require('./routes/verification'); // ✅ NEW
 
 // ========== Middleware ==========
 const { protect } = require('./middleware/auth');
 const { allowRoles } = require('./middleware/roleCheck');
 const { setCsrfToken, verifyCsrfToken } = require('./middleware/csrf');
 
+// ========== Environment Validation ==========
+const requiredEnvVars = [
+  'MONGO_URI',
+  'JWT_SECRET',
+  'STRIPE_SECRET_KEY',
+  'STRIPE_PUBLISHABLE_KEY',
+  'BREVO_API_KEY',
+  'BREVO_FROM_EMAIL',
+  'CORS_ORIGIN',
+  'CLOUDINARY_CLOUD_NAME',
+  'CLOUDINARY_API_KEY',
+  'CLOUDINARY_API_SECRET',
+];
+const missing = requiredEnvVars.filter((key) => !process.env[key]);
+if (missing.length) {
+  console.error(`❌ Missing required environment variables: ${missing.join(', ')}`);
+  process.exit(1);
+}
+
 // ========== App Setup ==========
 const app = express();
 
 // ---------- Security & middleware ----------
-app.use(helmet());
+app.use(
+  helmet({
+    contentSecurityPolicy: {
+      directives: {
+        defaultSrc: ["'self'"],
+        scriptSrc: ["'self'", "https://js.stripe.com"],
+        styleSrc: ["'self'", "'unsafe-inline'"],
+        imgSrc: ["'self'", "data:", "https://res.cloudinary.com"],
+        connectSrc: ["'self'", process.env.CORS_ORIGIN],
+        frameSrc: ["'none'"],
+        objectSrc: ["'none'"],
+      },
+    },
+  })
+);
+
 app.use(
   cors({
-    origin: process.env.CORS_ORIGIN || 'https://shimmering-brigadeiros-8c1154.netlify.app',
+    origin: process.env.CORS_ORIGIN,
     credentials: true,
   })
 );
@@ -69,20 +107,37 @@ app.get('/api/health', (req, res) => {
   res.status(200).json({
     status: 'ok',
     timestamp: new Date().toISOString(),
-    uptime: process.uptime()
+    uptime: process.uptime(),
   });
 });
 
 // ========== Trust proxy (Render) ==========
-app.set('trust proxy', 1); // ✅ Prevents permissive warning
+app.set('trust proxy', 1);
 
 // ---------- Rate limiting ----------
-const limiter = rateLimit({
+const globalLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 200,
   skip: (req) => req.path.startsWith('/api/notifications') || req.path === '/api/health',
 });
-app.use('/api/', limiter);
+app.use('/api/', globalLimiter);
+
+// Stricter limits for auth endpoints
+const authLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 10,
+  skipSuccessfulRequests: true,
+});
+app.use('/api/auth/login', authLimiter);
+app.use('/api/auth/register', authLimiter);
+
+const resetLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 5,
+  skipSuccessfulRequests: true,
+});
+app.use('/api/send-reset-code', resetLimiter);
+app.use('/api/verify-reset-code', resetLimiter);
 
 // ---------- Stripe webhook (raw body) ----------
 app.post(
@@ -108,7 +163,6 @@ app.post(
         const metadata = paymentIntent.metadata;
         console.log(`✅ PaymentIntent succeeded: ${paymentIntent.id}`);
 
-        // ===== WALLET TOP‑UP =====
         if (metadata.type === 'wallet_topup') {
           const userId = metadata.userId;
           const amount = parseFloat(metadata.amount);
@@ -129,9 +183,7 @@ app.post(
             );
             console.log(`💰 Wallet credited: ${amount} KES for user ${userId}`);
           }
-        }
-        // ===== SPONSORSHIP =====
-        else if (metadata.type === 'sponsorship') {
+        } else if (metadata.type === 'sponsorship') {
           const productId = metadata.productId;
           const days = parseInt(metadata.days);
           if (productId && days) {
@@ -143,9 +195,7 @@ app.post(
               console.log(`⭐ Product ${product.name} (${productId}) sponsored for ${days} days via Stripe.`);
             }
           }
-        }
-        // ===== ORDER PAYMENT =====
-        else {
+        } else {
           const orderId = metadata.orderId;
           if (orderId) {
             await Order.findByIdAndUpdate(orderId, {
@@ -176,21 +226,25 @@ app.post(
 // ---------- JSON parser (after webhook) ----------
 app.use(express.json({ limit: '10mb' }));
 
-// ========== ✅ MIDDLEWARE ORDER FIX – BEFORE ROUTES ==========
-
-// 1. Attach `req.setCsrfToken()` so auth routes can use it
+// ========== ✅ Attach CSRF helper ==========
 app.use((req, res, next) => {
   req.setCsrfToken = () => setCsrfToken(req, res);
   next();
 });
 
-// 2. CSRF verification (excluding whitelisted paths)
+// ========== ✅ CSRF Excluded Paths ==========
 const csrfExcludedPaths = [
   '/api/auth/login',
   '/api/auth/register',
   '/api/auth/logout',
   '/api/stripe/webhook',
-  '/api/mpesa/callback'
+  '/api/mpesa/callback',
+  '/api/send-verification',
+  '/api/verify-and-register',
+  '/api/send-verification-generic',
+  '/api/verify-code',
+  '/api/send-reset-code',
+  '/api/verify-reset-code',
 ];
 app.use((req, res, next) => {
   if (csrfExcludedPaths.includes(req.path)) {
@@ -202,7 +256,19 @@ app.use((req, res, next) => {
 // ---------- MongoDB connection ----------
 mongoose
   .connect(process.env.MONGO_URI)
-  .then(() => console.log('✅ MongoDB connected'))
+  .then(async () => {
+    console.log('✅ MongoDB connected');
+    // ========== Create indexes ==========
+    await Promise.all([
+      Order.createIndexes(),
+      User.createIndexes(),
+      Product.createIndexes(),
+      Settlement.createIndexes(),
+      Withdrawal.createIndexes(),
+      PickupStation.createIndexes(),
+    ]);
+    console.log('✅ Database indexes created');
+  })
   .catch((err) => console.error('❌ MongoDB connection error:', err));
 
 // ---------- Owner creation ----------
@@ -232,7 +298,7 @@ async function createOwnerIfNotExists() {
   }
 }
 
-// ---------- Routes (NOW AFTER MIDDLEWARE) ----------
+// ========== Routes (NOW AFTER MIDDLEWARE) ==========
 app.use('/api/auth', authRoutes);
 app.use('/api/users', userRoutes);
 app.use('/api/categories', categoryRoutes);
@@ -253,6 +319,7 @@ app.use('/api/withdrawals', withdrawalRoutes);
 app.use('/api/notifications', notificationRoutes);
 app.use('/api/audit', auditRoutes);
 app.use('/api/reports', reportRoutes);
+app.use('/api', verificationRoutes); // ✅ Mount verification routes
 
 // ---------- M‑Pesa Configuration ----------
 const CONSUMER_KEY = process.env.CONSUMER_KEY;
@@ -270,7 +337,6 @@ async function getAccessToken() {
   return response.data.access_token;
 }
 
-// ===== M‑Pesa initiation helper =====
 async function initiateMpesaPayment(phoneNumber, amount, accountRef) {
   let formattedPhone = phoneNumber.toString().replace(/\D/g, '');
   if (formattedPhone.startsWith('0')) formattedPhone = '254' + formattedPhone.slice(1);
@@ -301,10 +367,9 @@ async function initiateMpesaPayment(phoneNumber, amount, accountRef) {
   return response.data;
 }
 
-// ===== Attach helper to global so wallet.js can use it =====
 global.initiateMpesaPayment = initiateMpesaPayment;
 
-// ---------- M‑Pesa STK Push endpoint (order payments) ----------
+// ---------- M‑Pesa STK Push endpoint ----------
 app.post('/api/mpesa/stkpush', protect, async (req, res) => {
   const { phoneNumber, amount, orderId } = req.body;
   if (!phoneNumber || !amount)
@@ -343,7 +408,6 @@ app.post('/api/mpesa/callback', async (req, res) => {
     )?.Value;
     const accountRef = callbackData.AccountReference;
 
-    // ===== WALLET TOP‑UP =====
     if (accountRef && accountRef.startsWith('TOPUP-')) {
       const topUp = await TopUpRequest.findOne({ merchantRequestId, status: 'pending' });
       if (topUp) {
@@ -372,7 +436,6 @@ app.post('/api/mpesa/callback', async (req, res) => {
       return res.json({ ResultCode: 0, ResultDesc: 'Success' });
     }
 
-    // ===== SPONSORSHIP =====
     if (accountRef && accountRef.startsWith('SPONSOR')) {
       const SponsorshipRequest = require('./models/SponsorshipRequest');
       const pendingRequest = await SponsorshipRequest.findOne({ merchantRequestId, status: 'pending' });
@@ -394,7 +457,6 @@ app.post('/api/mpesa/callback', async (req, res) => {
       return res.json({ ResultCode: 0, ResultDesc: 'Success' });
     }
 
-    // ===== ORDER PAYMENT =====
     const Order = require('./models/Order');
     const order = await Order.findOne({ mpesaMerchantRequestId: merchantRequestId });
     if (!order) {
@@ -421,7 +483,7 @@ app.post('/api/mpesa/callback', async (req, res) => {
   }
 });
 
-// ---------- Payment Intent endpoint (Stripe) ----------
+// ---------- Stripe Payment Intent ----------
 app.post('/api/create-payment-intent', protect, async (req, res) => {
   const { amount, currency, paymentMethodId, orderId } = req.body;
   if (!amount || !paymentMethodId)
@@ -456,7 +518,7 @@ app.post('/api/create-payment-intent', protect, async (req, res) => {
   }
 });
 
-// ---------- Cloudinary test route (optional, temporary) ----------
+// ---------- Cloudinary test route ----------
 app.get('/api/test-cloudinary', async (req, res) => {
   const cloudinary = require('cloudinary').v2;
   try {
@@ -470,7 +532,8 @@ app.get('/api/test-cloudinary', async (req, res) => {
 // ---------- Basic error handler ----------
 app.use((err, req, res, next) => {
   console.error(err.stack);
-  res.status(500).json({ error: 'Something went wrong!' });
+  const message = process.env.NODE_ENV === 'production' ? 'Something went wrong!' : err.message;
+  res.status(500).json({ error: message });
 });
 
 // ---------- Auto-cancel cron ----------
@@ -499,6 +562,20 @@ cron.schedule('0 0 * * *', async () => {
     console.log(`Auto-cancel cron completed. Cancelled ${ordersToCancel.length} orders.`);
   } catch (err) {
     console.error('Auto-cancel cron error:', err);
+  }
+});
+
+// ---------- Sponsor expiry cron (daily at 1:00 AM) ----------
+cron.schedule('0 1 * * *', async () => {
+  console.log('Running sponsor expiry cron...');
+  try {
+    const result = await Product.updateMany(
+      { sponsored: true, sponsoredUntil: { $lt: new Date() } },
+      { sponsored: false, sponsoredUntil: null }
+    );
+    console.log(`Expired ${result.modifiedCount} sponsorships.`);
+  } catch (err) {
+    console.error('Sponsor expiry cron error:', err);
   }
 });
 
