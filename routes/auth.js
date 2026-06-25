@@ -138,7 +138,7 @@ router.post(
 
     res.json({
       message: 'Login successful',
-      user: { id: user._id, userId: user.userId, fullName: user.fullName, email: user.email, role: user.role },
+      user: { id: user._id, userId: user.userId, fullName: user.fullName, email: user.email, role: user.role, referralCode: user.referralCode || null, },
       csrfToken,
     });
   }
