@@ -5,7 +5,7 @@ const User = require('../models/User');
 const { body, validationResult } = require('express-validator');
 const { protect } = require('../middleware/auth');
 const { sanitizeBody } = require('../middleware/sanitize');
-const { logAction } = require('../utils/audit'); // ✅ NEW
+const { logAction } = require('../utils/audit');
 const { sendWelcomeEmail } = require('../utils/email');
 
 const router = express.Router();
@@ -13,15 +13,16 @@ const router = express.Router();
 // ========== Register ==========
 router.post(
   '/register',
-  sanitizeBody(['fullName', 'email']), // ✅ NEW
+  sanitizeBody(['fullName', 'email']),
   [
     body('fullName').trim().notEmpty().withMessage('Full name required'),
     body('email').isEmail().normalizeEmail().withMessage('Valid email required'),
     body('password').isLength({ min: 6 }).withMessage('Password must be at least 6 characters'),
+    // ✅ Fixed: accepts null, undefined, or empty string as missing
     body('referralCode')
-      .optional()
+      .optional({ nullable: true, checkFalsy: true })
       .isAlphanumeric()
-      .withMessage('Referral code must be alphanumeric'), // ✅ NEW
+      .withMessage('Referral code must be alphanumeric'),
   ],
   async (req, res) => {
     const errors = validationResult(req);
@@ -55,7 +56,6 @@ router.post(
       maxAge: 7 * 24 * 60 * 60 * 1000,
     });
 
-    // Set CSRF token
     const csrfToken = req.setCsrfToken();
 
     res.status(201).json({
@@ -76,30 +76,25 @@ router.post(
   async (req, res) => {
     const { email, password } = req.body;
 
-    // 1. Find user
     const user = await User.findOne({ email });
 
-    // 2. If no user → log failed attempt
     if (!user) {
-      await logAction(req, 'login_failed', null, { email, reason: 'user_not_found' }); // ✅ NEW
+      await logAction(req, 'login_failed', null, { email, reason: 'user_not_found' });
       return res.status(401).json({ error: 'Invalid credentials' });
     }
 
-    // 3. Check suspension
     if (user.isSuspended) {
-      await logAction(req, 'login_failed', user._id, { reason: 'suspended' }); // ✅ NEW
+      await logAction(req, 'login_failed', user._id, { reason: 'suspended' });
       return res.status(403).json({ error: 'Account suspended' });
     }
 
-    // 4. Verify password
     const isMatch = await user.comparePassword(password);
     if (!isMatch) {
-      await logAction(req, 'login_failed', user._id, { reason: 'wrong_password' }); // ✅ NEW
+      await logAction(req, 'login_failed', user._id, { reason: 'wrong_password' });
       return res.status(401).json({ error: 'Invalid credentials' });
     }
 
-    // 5. Login success
-    await logAction(req, 'login_success', user._id, { email: user.email }); // ✅ NEW
+    await logAction(req, 'login_success', user._id, { email: user.email });
 
     const token = jwt.sign({ id: user._id, role: user.role }, process.env.JWT_SECRET, { expiresIn: '7d' });
     res.cookie('token', token, {
