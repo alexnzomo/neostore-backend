@@ -156,4 +156,19 @@ router.get('/me', protect, async (req, res) => {
   res.json({ user: req.user });
 });
 
+// GET /api/auth/csrf-token
+// Returns the current CSRF token from the cookie so the frontend can sync sessionStorage
+router.get('/csrf-token', protect, async (req, res) => {
+  try {
+    let token = req.cookies.csrfToken;
+    if (!token) {
+      // Generate a new one if missing (this also sets the cookie)
+      token = req.setCsrfToken();
+    }
+    res.json({ csrfToken: token });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 module.exports = router;
