@@ -46,7 +46,7 @@ const withdrawalRoutes = require('./routes/withdrawals');
 const notificationRoutes = require('./routes/notifications');
 const auditRoutes = require('./routes/audit');
 const reportRoutes = require('./routes/reports');
-const verificationRoutes = require('./routes/verification'); // ✅ NEW
+const verificationRoutes = require('./routes/verification');
 
 // ========== Middleware ==========
 const { protect } = require('./middleware/auth');
@@ -166,22 +166,31 @@ app.post(
         if (metadata.type === 'wallet_topup') {
           const userId = metadata.userId;
           const amount = parseFloat(metadata.amount);
+          console.log(`🔍 Stripe wallet top-up: userId=${userId}, amount=${amount}`);
           if (userId && amount) {
-            await WalletService.credit(
-              userId,
-              amount,
-              `Wallet top‑up via Stripe (${paymentIntent.id})`,
-              paymentIntent.id,
-              'topup'
-            );
-            await createNotification(
-              userId,
-              'system',
-              'Wallet top‑up successful',
-              `Your wallet has been credited with KES ${amount.toFixed(2)} via Stripe.`,
-              '/account.html'
-            );
-            console.log(`💰 Wallet credited: ${amount} KES for user ${userId}`);
+            try {
+              const result = await WalletService.credit(
+                userId,
+                amount,
+                `Wallet top‑up via Stripe (${paymentIntent.id})`,
+                paymentIntent.id,
+                'topup'
+              );
+              console.log(`💰 Stripe wallet credited: ${amount} KES for user ${userId}. New balance: ${result.newBalance}`);
+              await createNotification(
+                userId,
+                'system',
+                'Wallet top‑up successful',
+                `Your wallet has been credited with KES ${amount.toFixed(2)} via Stripe.`,
+                '/account.html'
+              );
+            } catch (err) {
+              console.error(`❌ Stripe wallet top-up FAILED for user ${userId}:`, err.message);
+              console.error(err.stack);
+              // Do NOT re-throw – the payment already succeeded; log it so admin can investigate.
+            }
+          } else {
+            console.warn(`⚠️ Stripe wallet top-up missing userId or amount in metadata:`, metadata);
           }
         } else if (metadata.type === 'sponsorship') {
           const productId = metadata.productId;
@@ -319,7 +328,7 @@ app.use('/api/withdrawals', withdrawalRoutes);
 app.use('/api/notifications', notificationRoutes);
 app.use('/api/audit', auditRoutes);
 app.use('/api/reports', reportRoutes);
-app.use('/api', verificationRoutes); // ✅ Mount verification routes
+app.use('/api', verificationRoutes);
 
 // ---------- M‑Pesa Configuration ----------
 const CONSUMER_KEY = process.env.CONSUMER_KEY;
@@ -412,26 +421,36 @@ app.post('/api/mpesa/callback', async (req, res) => {
       const topUp = await TopUpRequest.findOne({ merchantRequestId, status: 'pending' });
       if (topUp) {
         if (resultCode === 0) {
-          await WalletService.credit(
-            topUp.userId,
-            topUp.amount,
-            `Wallet top‑up via M‑Pesa (${transactionId})`,
-            transactionId,
-            'topup'
-          );
-          topUp.status = 'completed';
-          await createNotification(
-            topUp.userId,
-            'system',
-            'Wallet top‑up successful',
-            `Your wallet has been credited with KES ${topUp.amount.toFixed(2)} via M‑Pesa.`,
-            '/account.html'
-          );
-          console.log(`💰 Wallet credited via M‑Pesa for user ${topUp.userId}`);
+          console.log(`🔍 M-Pesa wallet top-up: userId=${topUp.userId}, amount=${topUp.amount}`);
+          try {
+            const result = await WalletService.credit(
+              topUp.userId,
+              topUp.amount,
+              `Wallet top‑up via M‑Pesa (${transactionId})`,
+              transactionId,
+              'topup'
+            );
+            console.log(`💰 M-Pesa wallet credited: ${topUp.amount} KES for user ${topUp.userId}. New balance: ${result.newBalance}`);
+            topUp.status = 'completed';
+            await createNotification(
+              topUp.userId,
+              'system',
+              'Wallet top‑up successful',
+              `Your wallet has been credited with KES ${topUp.amount.toFixed(2)} via M‑Pesa.`,
+              '/account.html'
+            );
+          } catch (err) {
+            console.error(`❌ M-Pesa wallet top-up FAILED for user ${topUp.userId}:`, err.message);
+            console.error(err.stack);
+            // Leave status as 'pending' so admin can manually investigate.
+          }
         } else {
+          console.log(`❌ M-Pesa wallet top-up failed. ResultCode: ${resultCode}`);
           topUp.status = 'failed';
         }
         await topUp.save();
+      } else {
+        console.warn(`⚠️ No pending TopUpRequest found for merchantRequestId: ${merchantRequestId}`);
       }
       return res.json({ ResultCode: 0, ResultDesc: 'Success' });
     }
@@ -576,6 +595,43 @@ cron.schedule('0 1 * * *', async () => {
     console.log(`Expired ${result.modifiedCount} sponsorships.`);
   } catch (err) {
     console.error('Sponsor expiry cron error:', err);
+  }
+});
+
+// ---------- Permanent delete archived products ----------
+const PERMANENT_DELETE_DAYS = parseInt(process.env.PERMANENT_DELETE_DAYS) || 30;
+
+cron.schedule('0 2 * * *', async () => {
+  console.log('Running permanent delete cron for archived products...');
+  try {
+    const cutoffDate = new Date();
+    cutoffDate.setDate(cutoffDate.getDate() - PERMANENT_DELETE_DAYS);
+
+    const Order = require('./models/Order');
+    const Product = require('./models/Product');
+
+    const archivedProducts = await Product.find({
+      isDeleted: true,
+      deletedAt: { $lt: cutoffDate }
+    });
+
+    let deletedCount = 0;
+    for (const product of archivedProducts) {
+      const pendingOrders = await Order.find({
+        'items.productId': product._id,
+        deliveryStatus: { $nin: ['delivered', 'cancelled'] }
+      });
+      if (pendingOrders.length === 0) {
+        await product.deleteOne();
+        deletedCount++;
+        console.log(`Permanently deleted product ${product.name} (${product._id})`);
+      } else {
+        console.log(`Skipped deleting product ${product.name} because it has pending orders.`);
+      }
+    }
+    console.log(`Permanent delete cron completed. Deleted ${deletedCount} products.`);
+  } catch (err) {
+    console.error('Permanent delete cron error:', err);
   }
 });
 

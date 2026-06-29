@@ -62,6 +62,30 @@ const orderSchema = new mongoose.Schema({
   balanceDue: { type: Number, default: 0, min: 0 },
   cashCollected: { type: Number, default: 0, min: 0 },
   remainingBalance: { type: Number, default: 0, min: 0 },
+  // === Manual Payment Verification (Fraud Prevention) ===
+  manualPaymentMethod: {
+    type: String,
+    enum: ['cash', 'bank_transfer', 'manual_mpesa', null],
+    default: null
+  },
+  manualPaymentReference: {
+    type: String,
+    default: null
+  },
+  manualPaymentVerificationStatus: {
+    type: String,
+    enum: ['pending', 'verified', 'rejected'],
+    default: null
+  },
+  manualPaymentVerifiedBy: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'User',
+    default: null
+  },
+  manualPaymentVerifiedAt: {
+    type: Date,
+    default: null
+  },  
   assignedAgentId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null },
   createdAt: { type: Date, default: Date.now },
   updatedAt: { type: Date, default: Date.now }

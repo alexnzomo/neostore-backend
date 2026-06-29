@@ -33,6 +33,11 @@ async function getSetting(key) {
 }
 
 async function createSettlementsForOrder(order) {
+  // 🔴 FRAUD PREVENTION: Block settlements for unverified manual payments
+  if (order.manualPaymentMethod && order.manualPaymentMethod !== 'cash' && order.manualPaymentVerificationStatus !== 'verified') {
+    console.log(`⛔ Order ${order.orderId} has pending manual payment verification. Settlements blocked.`);
+    return;
+  }  
   const vendorMap = {};
   const categories = await Category.find();
   for (const item of order.items) {
@@ -516,9 +521,10 @@ router.put(
   '/:id/record-cash',
   protect,
   allowRoles('agent', 'admin', 'owner', 'station_manager'),
-  sanitizeBody(['amount']),
+  sanitizeBody(['amount', 'manualPaymentMethod', 'manualPaymentReference']),
   [
     body('amount').isFloat({ min: 1 }).withMessage('Amount must be positive'),
+    body('manualPaymentMethod').isIn(['cash', 'bank_transfer', 'manual_mpesa']).withMessage('Invalid payment method'),
   ],
   async (req, res) => {
     const errors = validationResult(req);
@@ -527,10 +533,13 @@ router.put(
     }
 
     try {
-      const { amount } = req.body;
+      const { amount, manualPaymentMethod, manualPaymentReference } = req.body;
+      const verified = req.body.verified === true; // checkbox from frontend
+
       const order = await Order.findById(req.params.id);
       if (!order) return res.status(404).json({ error: 'Order not found' });
 
+      // Station manager permission check
       if (req.user.role === 'station_manager') {
         const allowed = await canStationManageOrder(req.user._id, order);
         if (!allowed) {
@@ -538,6 +547,21 @@ router.put(
         }
       }
 
+      // 🔴 FOR BANK / M-PESA: Verification and reference are MANDATORY
+      if (['bank_transfer', 'manual_mpesa'].includes(manualPaymentMethod)) {
+        if (!verified) {
+          return res.status(400).json({
+            error: 'You must verify the payment (check your bank/MPesa statement) before recording.'
+          });
+        }
+        if (!manualPaymentReference || manualPaymentReference.trim() === '') {
+          return res.status(400).json({
+            error: 'Reference number (e.g., M-Pesa code, Bank ref) is required for this payment method.'
+          });
+        }
+      }
+
+      // Check remaining balance
       if (!order.remainingBalance || order.remainingBalance <= 0) {
         return res.status(400).json({ error: 'No remaining balance to collect' });
       }
@@ -545,21 +569,108 @@ router.put(
         return res.status(400).json({ error: 'Amount exceeds remaining balance' });
       }
 
+      // Update financial fields
       order.cashCollected += amount;
       order.remainingBalance -= amount;
       if (order.remainingBalance === 0) {
         order.paymentStatus = 'fully_paid';
       }
+
+      // Store manual payment details
+      order.manualPaymentMethod = manualPaymentMethod;
+      order.manualPaymentReference = manualPaymentReference || null;
+
+      // ✅ Cash is verified instantly. Bank/M-Pesa goes to Admin queue.
+      order.manualPaymentVerificationStatus = manualPaymentMethod === 'cash' ? 'verified' : 'pending';
+      order.manualPaymentVerifiedBy = req.user._id;
+      order.manualPaymentVerifiedAt = new Date();
+
       await order.save();
 
-      await logAction(req, 'record_cash', order.customerId, { orderId: order._id, amount, newRemaining: order.remainingBalance });
+      // ✅ Only trigger settlements if FULLY PAID, DELIVERED, and VERIFIED (cash only at this stage)
+      if (order.paymentStatus === 'fully_paid' && order.deliveryStatus === 'delivered') {
+        if (order.manualPaymentVerificationStatus === 'verified') {
+          await createSettlementsForOrder(order);
+        }
+      }
 
-      if (order.deliveryStatus === 'delivered' && (order.paymentStatus === 'fully_paid' || order.paymentStatus === 'cash_collected')) {
+      await logAction(req, 'record_manual_payment', order.customerId, {
+        amount,
+        method: manualPaymentMethod,
+        verified,
+        reference: manualPaymentReference,
+        status: order.manualPaymentVerificationStatus
+      });
+
+      res.json({
+        success: true,
+        cashCollected: order.cashCollected,
+        remainingBalance: order.remainingBalance,
+        paymentStatus: order.paymentStatus,
+        verificationStatus: order.manualPaymentVerificationStatus
+      });
+    } catch (err) {
+      console.error('Record cash error:', err);
+      res.status(500).json({ error: err.message });
+    }
+  }
+);
+
+// ============================================================
+// ADMIN VERIFIES OR REJECTS A MANUAL PAYMENT
+// ============================================================
+router.put(
+  '/:id/verify-manual-payment',
+  protect,
+  allowRoles('admin', 'owner'),
+  [
+    body('verified').isBoolean().withMessage('Verified must be true or false')
+  ],
+  async (req, res) => {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({ errors: errors.array() });
+    }
+
+    try {
+      const { verified } = req.body;
+      const order = await Order.findById(req.params.id);
+      if (!order) return res.status(404).json({ error: 'Order not found' });
+
+      // Cannot verify if it's not pending
+      if (order.manualPaymentVerificationStatus !== 'pending') {
+        return res.status(400).json({ error: 'This payment is not pending verification.' });
+      }
+
+      // Update status
+      order.manualPaymentVerificationStatus = verified ? 'verified' : 'rejected';
+      order.manualPaymentVerifiedBy = req.user._id;
+      order.manualPaymentVerifiedAt = new Date();
+
+      // ✅ If verified and fully paid/delivered, trigger settlements NOW
+      if (verified && order.paymentStatus === 'fully_paid' && order.deliveryStatus === 'delivered') {
         await createSettlementsForOrder(order);
       }
 
-      res.json({ success: true, cashCollected: order.cashCollected, remainingBalance: order.remainingBalance, paymentStatus: order.paymentStatus });
+      await order.save();
+
+      // Notify the agent who recorded it
+      await createNotification(
+        order.manualPaymentVerifiedBy,
+        'system',
+        verified ? '✅ Manual Payment Verified' : '❌ Manual Payment Rejected',
+        verified
+          ? `Order #${order.orderId} manual payment has been verified by admin.`
+          : `Order #${order.orderId} manual payment was rejected by admin. Please check the reference.`,
+        '/admin.html'
+      );
+
+      res.json({
+        success: true,
+        verificationStatus: order.manualPaymentVerificationStatus
+      });
     } catch (err) {
+      console.error('Verify manual payment error:', err);
       res.status(500).json({ error: err.message });
     }
   }

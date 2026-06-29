@@ -2,12 +2,14 @@ const express = require('express');
 const Product = require('../models/Product');
 const User = require('../models/User');
 const Settings = require('../models/Settings');
+const Order = require('../models/Order');
 const { protect } = require('../middleware/auth');
 const { allowRoles } = require('../middleware/roleCheck');
 const { body, validationResult } = require('express-validator');
 const { sanitizeBody } = require('../middleware/sanitize');
 const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
 const WalletService = require('../services/walletService');
+
 const axios = require('axios');
 
 const router = express.Router();
@@ -66,7 +68,7 @@ async function initiateMpesaPayment(phoneNumber, amount, orderId) {
 router.get('/', async (req, res) => {
   try {
     const { category, minPrice, maxPrice, search, sponsored } = req.query;
-    let filter = {};
+    let filter = {isDeleted: false};
     if (category && category !== 'all') filter.category = category;
     if (sponsored === 'true') filter.sponsored = true;
     if (search) filter.name = { $regex: search, $options: 'i' };
@@ -185,10 +187,28 @@ router.delete('/:id', protect, async (req, res) => {
   try {
     const product = await Product.findById(req.params.id);
     if (!product) return res.status(404).json({ error: 'Product not found' });
+
+    // Authorization check
     const isAuthorized = (req.user.role === 'owner' || req.user.role === 'admin' || product.vendorId.toString() === req.user._id.toString());
     if (!isAuthorized) return res.status(403).json({ error: 'Not authorized' });
-    await product.deleteOne();
-    res.json({ message: 'Product deleted' });
+
+    // 🔴 FRAUD / OPERATIONAL CHECK: Prevent deletion if there are pending orders
+    const pendingOrders = await Order.find({
+      'items.productId': product._id,
+      deliveryStatus: { $nin: ['delivered', 'cancelled'] }  // Any order not yet finished
+    });
+
+    if (pendingOrders.length > 0) {
+      return res.status(400).json({
+        error: `Cannot delete product because it has ${pendingOrders.length} pending order(s) (processing, shipped, out for delivery, or ready for pickup). Please fulfil or cancel these orders first.`
+      });
+    }
+
+    // ✅ Soft delete
+    product.isDeleted = true;
+    product.deletedAt = new Date();
+    await product.save();
+    res.json({ message: 'Product archived successfully' });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }

@@ -16,7 +16,9 @@ const productSchema = new mongoose.Schema({
   sponsored: { type: Boolean, default: false },
   sponsoredUntil: { type: Date, default: null },
   createdAt: { type: Date, default: Date.now },
-  updatedAt: { type: Date, default: Date.now }
+  updatedAt: { type: Date, default: Date.now },
+  isDeleted: { type: Boolean, default: false },
+  deletedAt: { type: Date, default: null }
 });
 
 // Auto-increment productId (PRD1001, PRD1002, ...)
