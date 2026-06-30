@@ -88,7 +88,8 @@ const orderSchema = new mongoose.Schema({
   },  
   assignedAgentId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null },
   createdAt: { type: Date, default: Date.now },
-  updatedAt: { type: Date, default: Date.now }
+  updatedAt: { type: Date, default: Date.now },
+  referralRewarded: { type: Boolean, default: false } 
 });
 
 orderSchema.statics.getNextOrderId = async function() {

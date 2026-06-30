@@ -5,7 +5,7 @@ const kycSchema = new mongoose.Schema({
   fullName: { type: String, required: true },
   dateOfBirth: { type: Date, required: true },
   nationality: { type: String, required: true },
-  idNumber: { type: String, required: true },
+  idNumber: { type: String, required: true, unique: true },
   idType: { type: String, enum: ['national_id', 'passport', 'drivers_license'], required: true },
   phoneNumber: { type: String, required: true },
   address: { type: String, required: true },

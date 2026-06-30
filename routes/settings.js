@@ -140,6 +140,47 @@ router.put('/withdrawals-frozen', protect, allowRoles('owner'), async (req, res)
   res.json({ success: true, frozen });
 });
 
+// ========== Referral Settings (Owner Only) ==========
+
+// Set referral percentage (0-100%)
+router.put(
+  '/referralPercentage',
+  protect,
+  allowRoles('owner'), // ✅ ONLY OWNER can change this
+  async (req, res) => {
+    const { value } = req.body;
+    if (value === undefined || isNaN(value) || value < 0 || value > 100) {
+      return res.status(400).json({ error: 'Percentage must be between 0 and 100' });
+    }
+    await Settings.findOneAndUpdate(
+      { key: 'referralPercentage' },
+      { key: 'referralPercentage', value },
+      { upsert: true, new: true }
+    );
+    res.json({ success: true, value });
+  }
+);
+
+// Set minimum order amount for referral reward
+router.put(
+  '/minReferralOrder',
+  protect,
+  allowRoles('owner'), // ✅ ONLY OWNER can change this
+  async (req, res) => {
+    const { value } = req.body;
+    if (value === undefined || isNaN(value) || value < 0) {
+      return res.status(400).json({ error: 'Minimum order must be a positive number' });
+    }
+    await Settings.findOneAndUpdate(
+      { key: 'minReferralOrder' },
+      { key: 'minReferralOrder', value },
+      { upsert: true, new: true }
+    );
+    res.json({ success: true, value });
+  }
+);
+
+
 // ========== Generic setting getter (fallback – keep LAST) ==========
 router.get('/:key', async (req, res) => {
   try {
@@ -150,5 +191,7 @@ router.get('/:key', async (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
+
+
 
 module.exports = router;

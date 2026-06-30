@@ -16,6 +16,7 @@ const { logAction } = require('../utils/audit');
 const { sanitizeBody } = require('../middleware/sanitize');
 const { body, validationResult } = require('express-validator');
 const { sendOrderConfirmationEmail } = require('../utils/email');
+const { processReferralReward } = require('../utils/referral');
 
 const router = express.Router();
 
@@ -752,11 +753,20 @@ router.put(
     try {
       const order = await Order.findById(req.params.id);
       if (!order) return res.status(404).json({ error: 'Order not found' });
+      
       order.paymentStatus = 'fully_paid';
       order.updatedAt = Date.now();
       await order.save();
 
       await logAction(req, 'mark_paid', order.customerId, { orderId: order._id });
+
+      // ✅ Process referral reward (if applicable)
+      try {
+        await processReferralReward(order);
+      } catch (err) {
+        console.error('❌ Referral reward failed for admin mark-paid:', err.message);
+        // Do NOT block the response – the order is already marked paid.
+      }
 
       res.json({ success: true, order });
     } catch (err) {

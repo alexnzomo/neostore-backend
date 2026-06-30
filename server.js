@@ -25,6 +25,7 @@ const Withdrawal = require('./models/Withdrawal');
 const WalletService = require('./services/walletService');
 const { createNotification } = require('./utils/notifications');
 const { sendOrderConfirmationEmail } = require('./utils/email'); // ✅ Email import
+const { processReferralReward } = require('./utils/referral');
 
 // ========== Routes ==========
 const authRoutes = require('./routes/auth');
@@ -205,22 +206,34 @@ app.post(
             }
           }
         } else {
+          // ✅ ORDER PAYMENT
           const orderId = metadata.orderId;
           if (orderId) {
-            await Order.findByIdAndUpdate(orderId, {
-              paymentStatus: 'fully_paid',
-              stripePaymentIntentId: paymentIntent.id,
-            });
+            const updatedOrder = await Order.findByIdAndUpdate(
+              orderId,
+              {
+                paymentStatus: 'fully_paid',
+                stripePaymentIntentId: paymentIntent.id,
+              },
+              { new: true }
+            );
             console.log(`✅ Order ${orderId} marked as fully paid.`);
-            // ✅ Send order confirmation email
+
+            // ✅ Process referral reward
             try {
-              const order = await Order.findById(orderId);
-              if (order) await sendOrderConfirmationEmail(order);
+              await processReferralReward(updatedOrder);
+            } catch (err) {
+              console.error('❌ Referral reward failed:', err.message);
+            }
+
+            // ✅ Send confirmation email
+            try {
+              await sendOrderConfirmationEmail(updatedOrder);
             } catch (err) {
               console.error('❌ Stripe confirmation email failed:', err.message);
             }
           }
-        }
+        } // ✅ <-- THIS CLOSING BRACE WAS MISSING!
         break;
       }
       case 'payment_intent.payment_failed': {
@@ -497,12 +510,21 @@ app.post('/api/mpesa/callback', async (req, res) => {
       order.mpesaAmount = amount;
       await order.save();
       console.log(`Order ${order.orderId} payment confirmed via M-Pesa. Transaction ID: ${transactionId}`);
-      // Send order confirmation email
+
+      // ✅ Send order confirmation email
       try {
         await sendOrderConfirmationEmail(order);
       } catch (err) {
         console.error('❌ M-Pesa confirmation email failed:', err.message);
       }
+
+      // ✅ Process referral reward (AFTER order is saved and confirmed paid)
+      try {
+        await processReferralReward(order);
+      } catch (err) {
+        console.error('❌ Referral reward failed for M-Pesa order:', err.message);
+      }
+
     } else {
       order.paymentStatus = 'payment_failed';
       order.mpesaFailureReason = callbackData.ResultDesc;
