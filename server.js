@@ -24,6 +24,7 @@ const Withdrawal = require('./models/Withdrawal');
 // ========== Services ==========
 const WalletService = require('./services/walletService');
 const { createNotification } = require('./utils/notifications');
+const { sendOrderConfirmationEmail } = require('./utils/email'); // ✅ Email import
 
 // ========== Routes ==========
 const authRoutes = require('./routes/auth');
@@ -187,7 +188,6 @@ app.post(
             } catch (err) {
               console.error(`❌ Stripe wallet top-up FAILED for user ${userId}:`, err.message);
               console.error(err.stack);
-              // Do NOT re-throw – the payment already succeeded; log it so admin can investigate.
             }
           } else {
             console.warn(`⚠️ Stripe wallet top-up missing userId or amount in metadata:`, metadata);
@@ -212,6 +212,13 @@ app.post(
               stripePaymentIntentId: paymentIntent.id,
             });
             console.log(`✅ Order ${orderId} marked as fully paid.`);
+            // ✅ Send order confirmation email
+            try {
+              const order = await Order.findById(orderId);
+              if (order) await sendOrderConfirmationEmail(order);
+            } catch (err) {
+              console.error('❌ Stripe confirmation email failed:', err.message);
+            }
           }
         }
         break;
@@ -307,7 +314,7 @@ async function createOwnerIfNotExists() {
   }
 }
 
-// ========== Routes (NOW AFTER MIDDLEWARE) ==========
+// ========== Routes ==========
 app.use('/api/auth', authRoutes);
 app.use('/api/users', userRoutes);
 app.use('/api/categories', categoryRoutes);
@@ -417,44 +424,44 @@ app.post('/api/mpesa/callback', async (req, res) => {
     )?.Value;
     const accountRef = callbackData.AccountReference;
 
-    if (accountRef && accountRef.startsWith('TOPUP-')) {
-      const topUp = await TopUpRequest.findOne({ merchantRequestId, status: 'pending' });
-      if (topUp) {
-        if (resultCode === 0) {
-          console.log(`🔍 M-Pesa wallet top-up: userId=${topUp.userId}, amount=${topUp.amount}`);
-          try {
-            const result = await WalletService.credit(
-              topUp.userId,
-              topUp.amount,
-              `Wallet top‑up via M‑Pesa (${transactionId})`,
-              transactionId,
-              'topup'
-            );
-            console.log(`💰 M-Pesa wallet credited: ${topUp.amount} KES for user ${topUp.userId}. New balance: ${result.newBalance}`);
-            topUp.status = 'completed';
-            await createNotification(
-              topUp.userId,
-              'system',
-              'Wallet top‑up successful',
-              `Your wallet has been credited with KES ${topUp.amount.toFixed(2)} via M‑Pesa.`,
-              '/account.html'
-            );
-          } catch (err) {
-            console.error(`❌ M-Pesa wallet top-up FAILED for user ${topUp.userId}:`, err.message);
-            console.error(err.stack);
-            // Leave status as 'pending' so admin can manually investigate.
-          }
-        } else {
-          console.log(`❌ M-Pesa wallet top-up failed. ResultCode: ${resultCode}`);
-          topUp.status = 'failed';
+    console.log(`🔍 MerchantRequestID: ${merchantRequestId}, accountRef: ${accountRef}`);
+
+    // ===== STEP 1: Check if it's a wallet top-up (by MerchantRequestID) =====
+    const topUp = await TopUpRequest.findOne({ merchantRequestId, status: 'pending' });
+    if (topUp) {
+      if (resultCode === 0) {
+        console.log(`🔍 M-Pesa wallet top-up: userId=${topUp.userId}, amount=${topUp.amount}`);
+        try {
+          const result = await WalletService.credit(
+            topUp.userId,
+            topUp.amount,
+            `Wallet top‑up via M‑Pesa (${transactionId})`,
+            transactionId,
+            'topup'
+          );
+          console.log(`💰 M-Pesa wallet credited: ${topUp.amount} KES for user ${topUp.userId}. New balance: ${result.newBalance}`);
+          topUp.status = 'completed';
+          await createNotification(
+            topUp.userId,
+            'system',
+            'Wallet top‑up successful',
+            `Your wallet has been credited with KES ${topUp.amount.toFixed(2)} via M‑Pesa.`,
+            '/account.html'
+          );
+        } catch (err) {
+          console.error(`❌ M-Pesa wallet top-up FAILED for user ${topUp.userId}:`, err.message);
+          console.error(err.stack);
+          // Leave status as 'pending' so admin can manually investigate.
         }
-        await topUp.save();
       } else {
-        console.warn(`⚠️ No pending TopUpRequest found for merchantRequestId: ${merchantRequestId}`);
+        console.log(`❌ M-Pesa wallet top-up failed. ResultCode: ${resultCode}`);
+        topUp.status = 'failed';
       }
+      await topUp.save();
       return res.json({ ResultCode: 0, ResultDesc: 'Success' });
     }
 
+    // ===== STEP 2: Check if it's a sponsorship =====
     if (accountRef && accountRef.startsWith('SPONSOR')) {
       const SponsorshipRequest = require('./models/SponsorshipRequest');
       const pendingRequest = await SponsorshipRequest.findOne({ merchantRequestId, status: 'pending' });
@@ -476,6 +483,7 @@ app.post('/api/mpesa/callback', async (req, res) => {
       return res.json({ ResultCode: 0, ResultDesc: 'Success' });
     }
 
+    // ===== STEP 3: Otherwise, treat as order payment =====
     const Order = require('./models/Order');
     const order = await Order.findOne({ mpesaMerchantRequestId: merchantRequestId });
     if (!order) {
@@ -489,6 +497,12 @@ app.post('/api/mpesa/callback', async (req, res) => {
       order.mpesaAmount = amount;
       await order.save();
       console.log(`Order ${order.orderId} payment confirmed via M-Pesa. Transaction ID: ${transactionId}`);
+      // Send order confirmation email
+      try {
+        await sendOrderConfirmationEmail(order);
+      } catch (err) {
+        console.error('❌ M-Pesa confirmation email failed:', err.message);
+      }
     } else {
       order.paymentStatus = 'payment_failed';
       order.mpesaFailureReason = callbackData.ResultDesc;

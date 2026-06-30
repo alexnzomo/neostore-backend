@@ -15,6 +15,7 @@ const { createNotification } = require('../utils/notifications');
 const { logAction } = require('../utils/audit');
 const { sanitizeBody } = require('../middleware/sanitize');
 const { body, validationResult } = require('express-validator');
+const { sendOrderConfirmationEmail } = require('../utils/email');
 
 const router = express.Router();
 
@@ -268,6 +269,12 @@ router.post(
       }
 
       await newOrder.save();
+      // ✅ Send order confirmation email
+      try {
+        await sendOrderConfirmationEmail(newOrder);
+      } catch (err) {
+        console.error('Order confirmation email failed:', err.message);
+      }      
       await logAction(req, 'order_created', req.user._id, { orderId: newOrder._id, total: totalKES });
 
       res.status(201).json(newOrder);
