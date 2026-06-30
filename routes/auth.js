@@ -1,4 +1,3 @@
-// routes/auth.js
 const express = require('express');
 const jwt = require('jsonwebtoken');
 const crypto = require('crypto');
@@ -13,13 +12,13 @@ const router = express.Router();
 
 // ========== Helper: generate unique referral code ==========
 function generateReferralCode() {
-  return crypto.randomBytes(4).toString('hex').toUpperCase(); // e.g., "A3F9C7D2"
+  return crypto.randomBytes(4).toString('hex').toUpperCase();
 }
 
 // ========== Register ==========
 router.post(
   '/register',
-  sanitizeBody(['fullName', 'email']),
+  sanitizeBody(['fullName', 'email', 'phone']),
   [
     body('fullName').trim().notEmpty().withMessage('Full name required'),
     body('email').isEmail().normalizeEmail().withMessage('Valid email required'),
@@ -28,6 +27,18 @@ router.post(
       .optional({ nullable: true, checkFalsy: true })
       .isAlphanumeric()
       .withMessage('Referral code must be alphanumeric'),
+    // ✅ NEW: Phone validation (optional but unique if provided)
+    body('phone')
+      .optional({ nullable: true, checkFalsy: true })
+      .isMobilePhone()
+      .withMessage('Invalid phone number format')
+      .custom(async (value) => {
+        if (value) {
+          const existing = await User.findOne({ phone: value });
+          if (existing) throw new Error('Phone number already registered');
+        }
+        return true;
+      }),
   ],
   async (req, res) => {
     const errors = validationResult(req);
@@ -35,7 +46,7 @@ router.post(
       return res.status(400).json({ errors: errors.array() });
     }
 
-    const { fullName, email, password, referralCode: inputReferralCode } = req.body;
+    const { fullName, email, password, referralCode: inputReferralCode, phone } = req.body;
 
     // 1. Check if email already registered
     const existingUser = await User.findOne({ email });
@@ -52,9 +63,10 @@ router.post(
 
     // 3. Create user
     const userId = await User.getNextUserId();
-    const newUser = new User({ userId, fullName, email, password, referredBy });
+    // ✅ Include phone in the new user
+    const newUser = new User({ userId, fullName, email, password, phone: phone || null, referredBy });
 
-    // 4. ✅ Generate a unique referral code for the new user
+    // 4. Generate a unique referral code for the new user
     let referralCode = generateReferralCode();
     while (await User.findOne({ referralCode })) {
       referralCode = generateReferralCode();
@@ -89,7 +101,8 @@ router.post(
         fullName,
         email,
         role: newUser.role,
-        referralCode,   // ✅ included in response
+        referralCode,
+        phone: newUser.phone || null, // optional
       },
       csrfToken,
     });
@@ -138,7 +151,7 @@ router.post(
 
     res.json({
       message: 'Login successful',
-      user: { id: user._id, userId: user.userId, fullName: user.fullName, email: user.email, role: user.role, referralCode: user.referralCode || null, },
+      user: { id: user._id, userId: user.userId, fullName: user.fullName, email: user.email, role: user.role, referralCode: user.referralCode || null, phone: user.phone || null },
       csrfToken,
     });
   }
@@ -157,12 +170,10 @@ router.get('/me', protect, async (req, res) => {
 });
 
 // GET /api/auth/csrf-token
-// Returns the current CSRF token from the cookie so the frontend can sync sessionStorage
 router.get('/csrf-token', protect, async (req, res) => {
   try {
     let token = req.cookies.csrfToken;
     if (!token) {
-      // Generate a new one if missing (this also sets the cookie)
       token = req.setCsrfToken();
     }
     res.json({ csrfToken: token });

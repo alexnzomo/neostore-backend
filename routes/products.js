@@ -68,7 +68,7 @@ async function initiateMpesaPayment(phoneNumber, amount, orderId) {
 router.get('/', async (req, res) => {
   try {
     const { category, minPrice, maxPrice, search, sponsored } = req.query;
-    let filter = {isDeleted: false};
+    let filter = { isDeleted: { $ne: true } };
     if (category && category !== 'all') filter.category = category;
     if (sponsored === 'true') filter.sponsored = true;
     if (search) filter.name = { $regex: search, $options: 'i' };
