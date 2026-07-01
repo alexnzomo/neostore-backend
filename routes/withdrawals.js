@@ -203,15 +203,46 @@ router.put(
         if (withdrawal.status !== 'approved') {
           return res.status(400).json({ error: 'Must be approved first' });
         }
-        // Deduct from wallet
-        const balance = await WalletService.getBalance(withdrawal.userId._id);
-        if (balance < withdrawal.amount) {
-          return res.status(400).json({ error: 'Insufficient balance' });
+
+        // ✅ ===== TIERED FEE LOGIC (INSERTED HERE) =====
+        let flatFee = 30;        // default
+        let percentageFee = 1;   // default 1%
+        let threshold = 10000;   // default KES 10,000
+
+        try {
+          const flatSetting = await Settings.findOne({ key: 'withdrawalFeeFlat' });
+          if (flatSetting) flatFee = flatSetting.value;
+          
+          const percSetting = await Settings.findOne({ key: 'withdrawalFeePercentage' });
+          if (percSetting) percentageFee = percSetting.value;
+          
+          const threshSetting = await Settings.findOne({ key: 'withdrawalFeeThreshold' });
+          if (threshSetting) threshold = threshSetting.value;
+        } catch (e) {}
+
+        let fee;
+        if (withdrawal.amount >= threshold) {
+          // Percentage fee (rounded to whole KES)
+          fee = Math.round((withdrawal.amount * percentageFee) / 100);
+        } else {
+          // Flat fee
+          fee = flatFee;
         }
+
+        const totalDebit = withdrawal.amount + fee;
+        // ===== END TIERED FEE LOGIC =====
+
+        // Check balance (against totalDebit, not just withdrawal.amount)
+        const balance = await WalletService.getBalance(withdrawal.userId._id);
+        if (balance < totalDebit) {
+          return res.status(400).json({ error: 'Insufficient balance (including fee)' });
+        }
+
+        // Deduct from wallet (totalDebit = amount + fee)
         const result = await WalletService.debit(
           withdrawal.userId._id,
-          withdrawal.amount,
-          `Withdrawal via ${withdrawal.method}`,
+          totalDebit,
+          `Withdrawal via ${withdrawal.method} (fee: KES ${fee})`,
           withdrawal._id,
           'withdrawal'
         );
@@ -222,6 +253,8 @@ router.put(
         await logAction(req, 'withdrawal_complete', withdrawal.userId._id, {
           withdrawalId: withdrawal._id,
           amount: withdrawal.amount,
+          fee: fee,
+          totalDebit: totalDebit,
           method: withdrawal.method,
           newBalance: result.newBalance
         });
@@ -231,7 +264,7 @@ router.put(
           withdrawal.userId._id,
           'system',
           'Withdrawal completed',
-          `Your withdrawal request of KES ${withdrawal.amount} has been completed and funds have been sent to your ${withdrawal.method} account.`,
+          `Your withdrawal request of KES ${withdrawal.amount} has been completed. A fee of KES ${fee} was deducted. Funds have been sent to your ${withdrawal.method} account.`,
           '/account.html'
         );
       }
