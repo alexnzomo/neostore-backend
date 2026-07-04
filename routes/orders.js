@@ -17,6 +17,9 @@ const { sanitizeBody } = require('../middleware/sanitize');
 const { body, validationResult } = require('express-validator');
 const { sendOrderConfirmationEmail } = require('../utils/email');
 const { processReferralReward } = require('../utils/referral');
+const CashRecord = require('../models/CashRecord');
+const KYC = require('../models/KYC');
+const Settings = require('../models/Settings');
 
 const router = express.Router();
 
@@ -101,20 +104,43 @@ async function createSettlementsForOrder(order) {
 
 // ========== Routes ==========
 
-// Get all orders (admin, owner, station_manager)
+// Get all orders (admin, owner, station_manager) – PAGINATED
 router.get('/', protect, allowRoles('admin', 'owner', 'station_manager'), async (req, res) => {
   try {
+    const limit = parseInt(req.query.limit) || 50;
+    const skip = parseInt(req.query.skip) || 0;
+    
     let query = {};
+
+    // ----  search filter ----
+    if (req.query.search) {
+      const search = req.query.search.trim();
+      query.$or = [
+        { orderId: { $regex: search, $options: 'i' } },
+        { customerName: { $regex: search, $options: 'i' } },
+        { customerPhone: { $regex: search, $options: 'i' } },
+        { mpesaTransactionId: { $regex: search, $options: 'i' } },
+        { stripePaymentIntentId: { $regex: search, $options: 'i' } },
+        { manualPaymentReference: { $regex: search, $options: 'i' } }
+      ];
+    }
+    // ---- End search filter ----    
+    
     if (req.user.role === 'station_manager') {
       const user = await User.findById(req.user._id).select('stationId');
       if (user && user.stationId) {
         query = { 'deliveryInfo.type': 'pickup', 'deliveryInfo.stationId': user.stationId };
       } else {
-        return res.json([]);
+        return res.json({ orders: [], total: 0, limit, skip });
       }
     }
-    const orders = await Order.find(query).sort({ createdAt: -1 });
-    res.json(orders);
+    
+    const [orders, total] = await Promise.all([
+      Order.find(query).sort({ createdAt: -1 }).skip(skip).limit(limit),
+      Order.countDocuments(query)
+    ]);
+    
+    res.json({ orders, total, limit, skip });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -219,6 +245,27 @@ router.post(
       let totalKES = subtotalKES - (discountAmountKES || 0) + shippingFeeKES;
       if (totalKES < 0) totalKES = 0;
 
+      // ===== KYC ENFORCEMENT (INSERTED HERE) =====
+      const kyc = await KYC.findOne({ userId: req.user._id });
+      const isKycVerified = kyc && kyc.status === 'verified';
+
+      const deliveryRequiredSetting = await Settings.findOne({ key: 'kyc_required_for_delivery' });
+      const kycRequiredForDelivery = deliveryRequiredSetting ? deliveryRequiredSetting.value === 'true' : false;
+      if (kycRequiredForDelivery && deliveryInfo.type === 'delivery' && !isKycVerified) {
+        return res.status(403).json({
+          error: 'KYC verification is required for door delivery. Please complete KYC in your account settings.'
+        });
+      }
+
+      const thresholdSetting = await Settings.findOne({ key: 'kyc_order_threshold' });
+      const threshold = thresholdSetting ? thresholdSetting.value : 0;
+      if (threshold > 0 && totalKES >= threshold && !isKycVerified) {
+        return res.status(403).json({
+          error: `KYC verification is required for orders above KES ${threshold}. Please complete KYC in your account settings.`
+        });
+      }
+      // ===== END KYC ENFORCEMENT =====
+
       let depositPaid = 0;
       let balanceDue = 0;
       let paymentStatus = 'pending';
@@ -267,6 +314,10 @@ router.post(
       // Deduct stock
       for (const item of items) {
         await Product.updateOne({ _id: item.productId }, { $inc: { stock: -item.quantity } });
+      }
+
+      if (req.body.location) {
+        newOrder.location = req.body.location;
       }
 
       await newOrder.save();
@@ -569,6 +620,44 @@ router.put(
         }
       }
 
+      // ---------- CASH ENABLED & LIMIT CHECKS ----------
+      if (manualPaymentMethod === 'cash') {
+        // 1. Master toggle
+        const enabledSetting = await Settings.findOne({ key: 'cash_enabled' });
+        const cashEnabled = enabledSetting ? enabledSetting.value === 'true' : true;
+        if (!cashEnabled) {
+          return res.status(403).json({ error: 'Cash payments are currently disabled by the owner.' });
+        }
+
+        // 2. Per‑order limit
+        const perOrderSetting = await Settings.findOne({ key: 'cash_max_per_order' });
+        const maxPerOrder = perOrderSetting ? perOrderSetting.value : 0;
+        if (maxPerOrder > 0 && amount > maxPerOrder) {
+          return res.status(400).json({
+            error: `Cash amount (KES ${amount}) exceeds per‑order limit of KES ${maxPerOrder}.`
+          });
+        }
+
+        // 3. Per‑agent daily limit
+        const perDaySetting = await Settings.findOne({ key: 'cash_max_per_agent_per_day' });
+        const maxPerDay = perDaySetting ? perDaySetting.value : 0;
+        if (maxPerDay > 0) {
+          const startOfDay = new Date();
+          startOfDay.setHours(0, 0, 0, 0);
+          const todayTotal = await CashRecord.aggregate([
+            { $match: { userId: req.user._id, recordedAt: { $gte: startOfDay } } },
+            { $group: { _id: null, total: { $sum: '$amount' } } }
+          ]);
+          const currentDayTotal = todayTotal.length > 0 ? todayTotal[0].total : 0;
+          if (currentDayTotal + amount > maxPerDay) {
+            return res.status(400).json({
+              error: `Daily cash limit (KES ${maxPerDay}) exceeded. Already collected KES ${currentDayTotal} today.`
+            });
+          }
+        }
+      }
+      // ---------- END CASH CHECKS ----------
+
       // Check remaining balance
       if (!order.remainingBalance || order.remainingBalance <= 0) {
         return res.status(400).json({ error: 'No remaining balance to collect' });
@@ -594,6 +683,15 @@ router.put(
       order.manualPaymentVerifiedAt = new Date();
 
       await order.save();
+
+      // If cash was recorded, save a CashRecord
+      if (manualPaymentMethod === 'cash') {
+        await CashRecord.create({
+          userId: req.user._id,
+          orderId: order._id,
+          amount
+        });
+      }
 
       // ✅ Only trigger settlements if FULLY PAID, DELIVERED, and VERIFIED (cash only at this stage)
       if (order.paymentStatus === 'fully_paid' && order.deliveryStatus === 'delivered') {
@@ -774,6 +872,17 @@ router.put(
     }
   }
 );
+
+// Get today's cash total for the logged‑in user (agent/station manager)
+router.get('/cash/today-total', protect, async (req, res) => {
+  const startOfDay = new Date();
+  startOfDay.setHours(0, 0, 0, 0);
+  const result = await CashRecord.aggregate([
+    { $match: { userId: req.user._id, recordedAt: { $gte: startOfDay } } },
+    { $group: { _id: null, total: { $sum: '$amount' } } }
+  ]);
+  res.json({ total: result.length > 0 ? result[0].total : 0 });
+});
 
 // Record who collected a pickup order
 router.put(

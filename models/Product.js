@@ -10,6 +10,7 @@ const productSchema = new mongoose.Schema({
   shippingFee: { type: Number, required: true, default: 100, min: 0 }, // KES
   imageUrl: { type: String, required: true },
   category: { type: String, required: true },
+  brand: { type: String, default: null },
   vendorId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
   vendorName: { type: String, required: true },
   commissionOverride: { type: Number, min: 0, max: 100, default: null }, // null = use category/global

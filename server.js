@@ -314,7 +314,7 @@ async function createOwnerIfNotExists() {
     const userId = await User.getNextUserId();
     const ownerUser = new User({
       userId,
-      fullName: 'Platform Owner',
+      fullName: 'Mwecheche Official',
       email: ownerEmail,
       password: ownerPasswordHash || (await bcrypt.hash('ChangeMe123!', 12)),
       role: 'owner',
@@ -436,6 +436,27 @@ app.post('/api/mpesa/callback', async (req, res) => {
       (item) => item.Name === 'Amount'
     )?.Value;
     const accountRef = callbackData.AccountReference;
+
+    // ===== IDEMPOTENCY CHECK (Prevent double processing) =====
+    const transactionId = callbackData.CallbackMetadata?.Item?.find(
+      (item) => item.Name === 'MpesaReceiptNumber'
+    )?.Value;
+
+    if (transactionId) {
+      // Check if this transaction ID already exists in orders
+      const existingOrder = await Order.findOne({ mpesaTransactionId: transactionId });
+      if (existingOrder) {
+        console.log(`⚠️ Duplicate M-Pesa callback for TXN: ${transactionId}. Ignoring.`);
+        return res.json({ ResultCode: 0, ResultDesc: 'Duplicate ignored' });
+      }
+      // Check if it exists in top-ups
+      const existingTopUp = await TopUpRequest.findOne({ 'metadata.transactionId': transactionId });
+      if (existingTopUp) {
+        console.log(`⚠️ Duplicate M-Pesa top-up callback for TXN: ${transactionId}. Ignoring.`);
+        return res.json({ ResultCode: 0, ResultDesc: 'Duplicate ignored' });
+      }
+    }
+    // ===== END IDEMPOTENCY CHECK =====
 
     console.log(`🔍 MerchantRequestID: ${merchantRequestId}, accountRef: ${accountRef}`);
 

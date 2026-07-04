@@ -21,6 +21,10 @@ const userSchema = new mongoose.Schema({
   suspendedUntil: { type: Date },
   walletBalance: { type: Number, default: 0, min: 0 },
   stationId: { type: mongoose.Schema.Types.ObjectId, ref: 'PickupStation', default: null }, // ✅ ADDED
+  location: {
+    type: { type: String, enum: ['Point'], default: 'Point' },
+    coordinates: { type: [Number], index: '2dsphere' }
+  },  
   referralCode: { type: String, unique: true, sparse: true },
   referredBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
   emailVerified: { type: Boolean, default: false },

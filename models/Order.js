@@ -45,6 +45,12 @@ const orderSchema = new mongoose.Schema({
     stationId: { type: mongoose.Schema.Types.ObjectId, ref: 'PickupStation' },
     stationName: String
   },
+
+  location: {
+    type: { type: String, enum: ['Point'], default: 'Point' },
+    coordinates: { type: [Number], index: '2dsphere' }
+  },  
+
   items: [orderItemSchema],
   subtotalUSD: { type: Number, required: true, min: 0 },
   discountAmountKES: { type: Number, default: 0, min: 0 },

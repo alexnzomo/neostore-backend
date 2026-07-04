@@ -64,7 +64,7 @@ router.post(
     // 3. Create user
     const userId = await User.getNextUserId();
     // ✅ Include phone in the new user
-    const newUser = new User({ userId, fullName, email, password, phone: phone || null, referredBy });
+    const newUser = new User({ userId, fullName, email, password, phone: phone || null, referredBy, emailVerified: true });
 
     // 4. Generate a unique referral code for the new user
     let referralCode = generateReferralCode();
@@ -103,6 +103,7 @@ router.post(
         role: newUser.role,
         referralCode,
         phone: newUser.phone || null, // optional
+        emailVerified: newUser.emailVerified,
       },
       csrfToken,
     });
@@ -151,7 +152,7 @@ router.post(
 
     res.json({
       message: 'Login successful',
-      user: { id: user._id, userId: user.userId, fullName: user.fullName, email: user.email, role: user.role, referralCode: user.referralCode || null, phone: user.phone || null },
+      user: { id: user._id, userId: user.userId, fullName: user.fullName, email: user.email, role: user.role, referralCode: user.referralCode || null, phone: user.phone || null, emailVerified: user.emailVerified },
       csrfToken,
     });
   }

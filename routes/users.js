@@ -11,11 +11,18 @@ const { body, validationResult } = require('express-validator'); // ✅ NEW
 
 const router = express.Router();
 
-// Get all users (admin/owner only)
+// Get all users (admin/owner only) – PAGINATED
 router.get('/', protect, allowRoles('admin', 'owner'), async (req, res) => {
   try {
-    const users = await User.find().select('-password');
-    res.json(users);
+    const limit = parseInt(req.query.limit) || 50;
+    const skip = parseInt(req.query.skip) || 0;
+    
+    const [users, total] = await Promise.all([
+      User.find().select('-password').skip(skip).limit(limit),
+      User.countDocuments()
+    ]);
+    
+    res.json({ users, total, limit, skip });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }

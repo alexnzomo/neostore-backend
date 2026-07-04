@@ -8,9 +8,14 @@ const pickupApplicationSchema = new mongoose.Schema({
   address: { type: String, required: true },
   city: { type: String, required: true },
   county: { type: String, required: true },
+  country: { type: String, default: 'Kenya' },
   phone: { type: String, required: true },
   email: { type: String },
   hours: { type: String },
+  location: {
+    type: { type: String, enum: ['Point'], default: 'Point' },
+    coordinates: { type: [Number], index: '2dsphere' }
+  },  
   notes: { type: String },
   status: { type: String, enum: ['pending', 'approved', 'rejected'], default: 'pending' },
   submittedAt: { type: Date, default: Date.now },

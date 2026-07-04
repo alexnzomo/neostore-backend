@@ -9,6 +9,7 @@ const { body, validationResult } = require('express-validator');
 const { sanitizeBody } = require('../middleware/sanitize');
 const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
 const WalletService = require('../services/walletService');
+const Review = require('../models/Review');
 
 const axios = require('axios');
 
@@ -78,6 +79,22 @@ router.get('/', async (req, res) => {
       if (maxPrice) filter.price.$lte = parseFloat(maxPrice);
     }
     const products = await Product.find(filter).sort({ sponsored: -1, createdAt: -1 });
+    // ----- ADD RATING AGGREGATION -----
+    const productIds = products.map(p => p._id);
+    const reviews = await Review.aggregate([
+      { $match: { productId: { $in: productIds } } },
+      { $group: { _id: '$productId', avg: { $avg: '$rating' }, count: { $sum: 1 } } }
+    ]);
+    const ratingMap = {};
+    reviews.forEach(r => { ratingMap[r._id.toString()] = { avg: r.avg, count: r.count }; });
+
+    products = products.map(p => {
+      const pId = p._id.toString();
+      const pObj = p.toObject();
+      pObj.averageRating = ratingMap[pId] ? ratingMap[pId].avg : 0;
+      pObj.totalReviews = ratingMap[pId] ? ratingMap[pId].count : 0;
+      return pObj;
+    });  
     res.json(products);
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -112,6 +129,7 @@ router.post('/', protect, allowRoles('vendor', 'admin', 'owner'), [
   body('shippingFee').isFloat({ min: 0 }).withMessage('Shipping fee must be positive'),
   body('imageUrl').isURL().withMessage('Invalid image URL'),
   body('category').trim().notEmpty().withMessage('Category is required'),
+  body('brand').optional().trim().isLength({ max: 100 }).withMessage('Brand too long'), 
   body('commissionOverride').optional().isFloat({ min: 0, max: 100 }).withMessage('Commission must be between 0 and 100'),
 ], async (req, res) => {
   const errors = validationResult(req);
@@ -130,6 +148,7 @@ router.post('/', protect, allowRoles('vendor', 'admin', 'owner'), [
       shippingFee,
       imageUrl,
       category,
+      brand: req.body.brand || null,
       vendorId: req.user._id,
       vendorName: req.user.fullName,
       commissionOverride: commissionOverride || null,
@@ -160,6 +179,7 @@ router.put('/:id', protect,
     body('shippingFee').optional().isFloat({ min: 0 }).withMessage('Shipping fee must be positive'),
     body('imageUrl').optional().isURL().withMessage('Invalid image URL'),
     body('category').optional().trim().notEmpty(),
+    body('brand').optional().trim().isLength({ max: 100 }).withMessage('Brand too long'),
     body('commissionOverride').optional().isFloat({ min: 0, max: 100 }).withMessage('Commission must be between 0 and 100'),
     body('sponsored').optional().isBoolean(),
   ],
@@ -172,7 +192,20 @@ router.put('/:id', protect,
       if (!product) return res.status(404).json({ error: 'Product not found' });
       const isAuthorized = (req.user.role === 'owner' || req.user.role === 'admin' || product.vendorId.toString() === req.user._id.toString());
       if (!isAuthorized) return res.status(403).json({ error: 'Not authorized' });
-      Object.assign(product, req.body);
+      
+      // Explicitly set only allowed fields (safer than Object.assign)
+      if (req.body.name !== undefined) product.name = req.body.name;
+      if (req.body.description !== undefined) product.description = req.body.description;
+      if (req.body.price !== undefined) product.price = req.body.price;
+      if (req.body.salePrice !== undefined) product.salePrice = req.body.salePrice;
+      if (req.body.stock !== undefined) product.stock = req.body.stock;
+      if (req.body.shippingFee !== undefined) product.shippingFee = req.body.shippingFee;
+      if (req.body.imageUrl !== undefined) product.imageUrl = req.body.imageUrl;
+      if (req.body.category !== undefined) product.category = req.body.category;
+      if (req.body.brand !== undefined) product.brand = req.body.brand;
+      if (req.body.commissionOverride !== undefined) product.commissionOverride = req.body.commissionOverride;
+      if (req.body.sponsored !== undefined) product.sponsored = req.body.sponsored;
+      
       product.updatedAt = Date.now();
       await product.save();
       res.json(product);

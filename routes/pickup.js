@@ -18,7 +18,12 @@ router.get('/', async (req, res) => {
 // Admin/owner: create station
 router.post('/', protect, allowRoles('admin', 'owner'), async (req, res) => {
   try {
-    const station = new PickupStation(req.body);
+    const stationData = { ...req.body };
+    // Ensure location is included if provided
+    if (req.body.location) {
+      stationData.location = req.body.location;
+    }
+    const station = new PickupStation(stationData);
     await station.save();
     res.status(201).json(station);
   } catch (err) {
@@ -29,8 +34,18 @@ router.post('/', protect, allowRoles('admin', 'owner'), async (req, res) => {
 // Admin/owner: update station
 router.put('/:id', protect, allowRoles('admin', 'owner'), async (req, res) => {
   try {
-    const station = await PickupStation.findByIdAndUpdate(req.params.id, req.body, { new: true });
+    const station = await PickupStation.findById(req.params.id);
     if (!station) return res.status(404).json({ error: 'Station not found' });
+    
+    // Update fields
+    Object.assign(station, req.body);
+    
+    // If location is provided, ensure it's set
+    if (req.body.location) {
+      station.location = req.body.location;
+    }
+    
+    await station.save();
     res.json(station);
   } catch (err) {
     res.status(500).json({ error: err.message });

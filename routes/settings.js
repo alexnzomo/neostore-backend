@@ -180,6 +180,99 @@ router.put(
   }
 );
 
+// ========== Cash Payment Controls ==========
+
+// Get cash enabled status (public)
+router.get('/cash-enabled', async (req, res) => {
+  const setting = await Settings.findOne({ key: 'cash_enabled' });
+  res.json({ enabled: setting ? setting.value === 'true' : true });
+});
+
+// Update cash enabled (owner only)
+router.put('/cash-enabled', protect, allowRoles('owner'), async (req, res) => {
+  const { enabled } = req.body;
+  if (typeof enabled !== 'boolean') {
+    return res.status(400).json({ error: 'enabled must be a boolean' });
+  }
+  await Settings.findOneAndUpdate(
+    { key: 'cash_enabled' },
+    { key: 'cash_enabled', value: enabled ? 'true' : 'false' },
+    { upsert: true, new: true }
+  );
+  res.json({ success: true, enabled });
+});
+
+// Get per‑order cash limit (0 = no limit)
+router.get('/cash-max-per-order', async (req, res) => {
+  const setting = await Settings.findOne({ key: 'cash_max_per_order' });
+  res.json({ value: setting ? setting.value : 0 });
+});
+
+// Update per‑order cash limit (owner only)
+router.put('/cash-max-per-order', protect, allowRoles('owner'), async (req, res) => {
+  const { value } = req.body;
+  if (value === undefined || value < 0) {
+    return res.status(400).json({ error: 'Value must be >= 0' });
+  }
+  await Settings.findOneAndUpdate(
+    { key: 'cash_max_per_order' },
+    { key: 'cash_max_per_order', value },
+    { upsert: true, new: true }
+  );
+  res.json({ success: true, value });
+});
+
+// Get per‑agent daily cash limit (0 = no limit)
+router.get('/cash-max-per-agent-per-day', async (req, res) => {
+  const setting = await Settings.findOne({ key: 'cash_max_per_agent_per_day' });
+  res.json({ value: setting ? setting.value : 0 });
+});
+
+// Update per‑agent daily cash limit (owner only)
+router.put('/cash-max-per-agent-per-day', protect, allowRoles('owner'), async (req, res) => {
+  const { value } = req.body;
+  if (value === undefined || value < 0) {
+    return res.status(400).json({ error: 'Value must be >= 0' });
+  }
+  await Settings.findOneAndUpdate(
+    { key: 'cash_max_per_agent_per_day' },
+    { key: 'cash_max_per_agent_per_day', value },
+    { upsert: true, new: true }
+  );
+  res.json({ success: true, value });
+});
+
+// Get/set KYC threshold for orders (0 = no threshold)
+router.get('/kyc-order-threshold', async (req, res) => {
+  const setting = await Settings.findOne({ key: 'kyc_order_threshold' });
+  res.json({ value: setting ? setting.value : 0 });
+});
+router.put('/kyc-order-threshold', protect, allowRoles('owner'), async (req, res) => {
+  const { value } = req.body;
+  if (value === undefined || value < 0) return res.status(400).json({ error: 'Value must be >= 0' });
+  await Settings.findOneAndUpdate(
+    { key: 'kyc_order_threshold' },
+    { key: 'kyc_order_threshold', value },
+    { upsert: true, new: true }
+  );
+  res.json({ success: true, value });
+});
+
+// Get/set whether KYC is required for door delivery (true/false)
+router.get('/kyc-required-for-delivery', async (req, res) => {
+  const setting = await Settings.findOne({ key: 'kyc_required_for_delivery' });
+  res.json({ required: setting ? setting.value === 'true' : false });
+});
+router.put('/kyc-required-for-delivery', protect, allowRoles('owner'), async (req, res) => {
+  const { required } = req.body;
+  if (typeof required !== 'boolean') return res.status(400).json({ error: 'Must be boolean' });
+  await Settings.findOneAndUpdate(
+    { key: 'kyc_required_for_delivery' },
+    { key: 'kyc_required_for_delivery', value: required ? 'true' : 'false' },
+    { upsert: true, new: true }
+  );
+  res.json({ success: true, required });
+});
 
 // ========== Generic setting getter (fallback – keep LAST) ==========
 router.get('/:key', async (req, res) => {

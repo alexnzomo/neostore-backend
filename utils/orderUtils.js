@@ -79,7 +79,27 @@ async function processRefund(order) {
 
   // 3. M‑Pesa – log and skip (manual reversal required)
   if (['mpesa', 'mpesa_deposit'].includes(order.paymentMethod)) {
-    console.log(`M-Pesa refund for order ${order.orderId} (TXN: ${order.mpesaTransactionId}) – manual processing required.`);
+    console.log(`M-Pesa refund for order ${order.orderId} (TXN: ${order.mpesaTransactionId}) requires manual processing.`);
+    
+    // ===== ADMIN NOTIFICATION =====
+    const User = require('../models/User');
+    const { createNotification } = require('./notifications');
+    
+    // Get all admins and owners
+    const admins = await User.find({ role: { $in: ['admin', 'owner'] } });
+    
+    // Send notification to each admin
+    for (const admin of admins) {
+      await createNotification(
+        admin._id,
+        'system',
+        '⚠️ M‑Pesa Refund Required',
+        `Order #${order.orderId} (TXN: ${order.mpesaTransactionId}) needs manual reversal in the M‑Pesa portal.`,
+        '/admin.html?tab=orders'
+      );
+    }
+    // ===== END ADMIN NOTIFICATION =====
+  }
     // You can integrate M‑Pesa reversal API here.
   }
 
