@@ -19,7 +19,6 @@ const { sendOrderConfirmationEmail } = require('../utils/email');
 const { processReferralReward } = require('../utils/referral');
 const CashRecord = require('../models/CashRecord');
 const KYC = require('../models/KYC');
-const Settings = require('../models/Settings');
 
 const router = express.Router();
 
