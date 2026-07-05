@@ -4,6 +4,7 @@ const Order = require('../models/Order');
 const { protect } = require('../middleware/auth');
 const { sanitizeBody } = require('../middleware/sanitize');
 const { createNotification } = require('../utils/notifications');
+const { allowRoles } = require('../middleware/roleCheck');
 
 const router = express.Router();
 
