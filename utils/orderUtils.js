@@ -100,8 +100,6 @@ async function processRefund(order) {
     }
     // ===== END ADMIN NOTIFICATION =====
   }
-    // You can integrate M‑Pesa reversal API here.
-  }
 
   // 4. Cash – no online refund; admin handles manually.
 }
