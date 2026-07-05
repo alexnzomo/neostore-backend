@@ -5,7 +5,7 @@ const { protect } = require('../middleware/auth');
 const { createNotification } = require('../utils/notifications');
 const { allowRoles } = require('../middleware/roleCheck');
 const { sanitizeBody } = require('../middleware/sanitize');
-
+const { body, validationResult } = require('express-validator');
 
 const router = express.Router();
 
