@@ -438,9 +438,6 @@ app.post('/api/mpesa/callback', async (req, res) => {
     const accountRef = callbackData.AccountReference;
 
     // ===== IDEMPOTENCY CHECK (Prevent double processing) =====
-    const transactionId = callbackData.CallbackMetadata?.Item?.find(
-      (item) => item.Name === 'MpesaReceiptNumber'
-    )?.Value;
 
     if (transactionId) {
       // Check if this transaction ID already exists in orders
