@@ -2,9 +2,10 @@ const express = require('express');
 const Review = require('../models/Review');
 const Order = require('../models/Order');
 const { protect } = require('../middleware/auth');
-const { sanitizeBody } = require('../middleware/sanitize');
 const { createNotification } = require('../utils/notifications');
 const { allowRoles } = require('../middleware/roleCheck');
+const { sanitizeBody } = require('../middleware/sanitize');
+
 
 const router = express.Router();
 
