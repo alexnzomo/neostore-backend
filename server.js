@@ -78,6 +78,7 @@ if (missing.length) {
 const app = express();
 
 // ---------- Security & middleware ----------
+// ---------- Security & middleware ----------
 app.use(
   helmet({
     contentSecurityPolicy: {
@@ -86,7 +87,12 @@ app.use(
         scriptSrc: ["'self'", "https://js.stripe.com"],
         styleSrc: ["'self'", "'unsafe-inline'"],
         imgSrc: ["'self'", "data:", "https://res.cloudinary.com"],
-        connectSrc: ["'self'", process.env.CORS_ORIGIN],
+        connectSrc: [
+          "'self'",
+          "https://shimmering-brigadeiros-8c1154.netlify.app",
+          "https://mwechestore.com",
+          "https://www.mwechestore.com"
+        ],
         frameSrc: ["'none'"],
         objectSrc: ["'none'"],
       },
@@ -96,7 +102,7 @@ app.use(
 
 app.use(
   cors({
-    origin: process.env.CORS_ORIGIN,
+    origin: process.env.CORS_ORIGIN || 'https://mwechestore.com',
     credentials: true,
   })
 );
