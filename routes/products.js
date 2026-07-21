@@ -68,6 +68,7 @@ async function initiateMpesaPayment(phoneNumber, amount, orderId) {
 // Get all products (public)
 router.get('/', async (req, res) => {
   try {
+    console.log('Products route called with query:', req.query);
     const { category, minPrice, maxPrice, search, sponsored } = req.query;
     let filter = { isDeleted: { $ne: true } };
     if (category && category !== 'all') filter.category = category;
@@ -78,25 +79,36 @@ router.get('/', async (req, res) => {
       if (minPrice) filter.price.$gte = parseFloat(minPrice);
       if (maxPrice) filter.price.$lte = parseFloat(maxPrice);
     }
-    const products = await Product.find(filter).sort({ sponsored: -1, createdAt: -1 });
-    // ----- ADD RATING AGGREGATION -----
-    const productIds = products.map(p => p._id);
-    const reviews = await Review.aggregate([
-      { $match: { productId: { $in: productIds } } },
-      { $group: { _id: '$productId', avg: { $avg: '$rating' }, count: { $sum: 1 } } }
-    ]);
-    const ratingMap = {};
-    reviews.forEach(r => { ratingMap[r._id.toString()] = { avg: r.avg, count: r.count }; });
+    let products = await Product.find(filter).sort({ sponsored: -1, createdAt: -1 });
+    console.log(`Found ${products.length} products`);
 
-    products = products.map(p => {
-      const pId = p._id.toString();
-      const pObj = p.toObject();
-      pObj.averageRating = ratingMap[pId] ? ratingMap[pId].avg : 0;
-      pObj.totalReviews = ratingMap[pId] ? ratingMap[pId].count : 0;
-      return pObj;
-    });  
-    res.json(products);
+    // Safe rating aggregation
+    let productsWithRating = products.map(p => p.toObject());
+    try {
+      const productIds = products.map(p => p._id);
+      if (productIds.length > 0) {
+        const reviews = await Review.aggregate([
+          { $match: { productId: { $in: productIds } } },
+          { $group: { _id: '$productId', avg: { $avg: '$rating' }, count: { $sum: 1 } } }
+        ]);
+        const ratingMap = {};
+        reviews.forEach(r => { ratingMap[r._id.toString()] = { avg: r.avg, count: r.count }; });
+
+        productsWithRating = products.map(p => {
+          const pId = p._id.toString();
+          const pObj = p.toObject();
+          pObj.averageRating = ratingMap[pId] ? ratingMap[pId].avg : 0;
+          pObj.totalReviews = ratingMap[pId] ? ratingMap[pId].count : 0;
+          return pObj;
+        });
+      }
+    } catch (ratingErr) {
+      console.error('Rating aggregation failed, returning products without ratings:', ratingErr.message);
+    }
+
+    res.json(productsWithRating);
   } catch (err) {
+    console.error('Products fetch error:', err);
     res.status(500).json({ error: err.message });
   }
 });
