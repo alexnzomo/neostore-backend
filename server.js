@@ -100,9 +100,13 @@ app.use(
   })
 );
 
+const allowedOrigins = process.env.CORS_ORIGIN
+  ? process.env.CORS_ORIGIN.split(',').map(origin => origin.trim())
+  : ['https://www.mwechestore.com'];
+
 app.use(
   cors({
-    origin: process.env.CORS_ORIGIN || 'https://www.mwechestore.com',
+    origin: allowedOrigins,
     credentials: true,
   })
 );
