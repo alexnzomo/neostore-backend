@@ -102,7 +102,7 @@ app.use(
 
 app.use(
   cors({
-    origin: process.env.CORS_ORIGIN || 'https://mwechestore.com',
+    origin: process.env.CORS_ORIGIN || 'https://www.mwechestore.com',
     credentials: true,
   })
 );

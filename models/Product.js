@@ -11,6 +11,11 @@ const productSchema = new mongoose.Schema({
   imageUrl: { type: String, required: true },
   category: { type: String, required: true },
   brand: { type: String, default: null },
+  volumeCategory: {
+    type: String,
+    enum: ['small', 'medium', 'large'],
+    default: 'small'
+  },
   vendorId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
   vendorName: { type: String, required: true },
   commissionOverride: { type: Number, min: 0, max: 100, default: null }, // null = use category/global

@@ -274,6 +274,64 @@ router.put('/kyc-required-for-delivery', protect, allowRoles('owner'), async (re
   res.json({ success: true, required });
 });
 
+// Get shipping rates
+router.get('/shipping-rates', async (req, res) => {
+  const setting = await Settings.findOne({ key: 'shipping_rates' });
+  const defaultRates = {
+    delivery_region_fees: {
+      'Zone 0': 150, 
+      'Zone 1': 250,
+      'Zone 2': 400,
+      'Zone 3': 500,
+      'Zone 4': 600,
+      'Zone 5': 700,
+      'Zone 6': 900,
+      default: 600
+    },
+    pickup_region_fees: {
+      'Zone 1': 100,
+      'Zone 2': 150,
+      'Zone 3': 200,
+      'Zone 4': 250,
+      'Zone 5': 300,
+      'Zone 6': 400,
+      default: 100
+    },
+    volume_surcharges: {
+      small: 0,
+      medium: 150,
+      large: 350
+    }
+  };
+
+  // If no setting, or value is not a valid object, return defaults
+  if (!setting || typeof setting.value !== 'object' || setting.value === null) {
+    return res.json(defaultRates);
+  }
+
+  // Merge with defaults to guarantee all keys exist
+  const merged = { ...defaultRates, ...setting.value };
+  merged.delivery_region_fees = { ...defaultRates.delivery_region_fees, ...merged.delivery_region_fees };
+  merged.pickup_region_fees = { ...defaultRates.pickup_region_fees, ...merged.pickup_region_fees };
+  merged.volume_surcharges = { ...defaultRates.volume_surcharges, ...merged.volume_surcharges };
+  res.json(merged);
+});
+
+// Update shipping rates (owner only)
+router.put('/shipping-rates', protect, allowRoles('owner'), async (req, res) => {
+  const { delivery_region_fees, pickup_region_fees, volume_surcharges } = req.body;
+  if (!delivery_region_fees || !pickup_region_fees || !volume_surcharges) {
+    return res.status(400).json({ error: 'Missing required fields' });
+  }
+  const rates = { delivery_region_fees, pickup_region_fees, volume_surcharges };
+  await Settings.findOneAndUpdate(
+    { key: 'shipping_rates' },
+    { key: 'shipping_rates', value: rates },
+    { upsert: true, new: true }
+  );
+  res.json({ success: true, rates });
+});
+
 // ========== Generic setting getter (fallback – keep LAST) ==========
 router.get('/:key', async (req, res) => {
   try {

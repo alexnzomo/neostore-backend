@@ -6,21 +6,21 @@ const apiKey = defaultClient.authentications['api-key'];
 apiKey.apiKey = process.env.BREVO_API_KEY;
 const transactionalEmailsApi = new SibApiV3Sdk.TransactionalEmailsApi();
 const FROM_EMAIL = process.env.BREVO_FROM_EMAIL;
-const FRONTEND_URL = process.env.FRONTEND_URL || 'https://mwecheche.com';
+const FRONTEND_URL = process.env.FRONTEND_URL || 'https://www.mwechestore.com';
 
 // ========== Base email sender ==========
 async function sendEmail({ to, subject, html }) {
   if (!to) throw new Error('Recipient email is required');
   const sendSmtpEmail = new SibApiV3Sdk.SendSmtpEmail();
   sendSmtpEmail.to = [{ email: to }];
-  sendSmtpEmail.sender = { email: FROM_EMAIL, name: 'Mwecheche' };
+  sendSmtpEmail.sender = { email: FROM_EMAIL, name: 'Mwechestore' };
   sendSmtpEmail.subject = subject;
   sendSmtpEmail.htmlContent = html;
   return await transactionalEmailsApi.sendTransacEmail(sendSmtpEmail);
 }
 
 // ========== Layout wrapper ==========
-function emailLayout(content, title = 'Mwecheche') {
+function emailLayout(content, title = 'Mwechestore') {
   return `
   <!DOCTYPE html>
   <html>
@@ -28,13 +28,13 @@ function emailLayout(content, title = 'Mwecheche') {
   <body style="font-family: system-ui, -apple-system, sans-serif; background: #fafaf9; margin: 0; padding: 20px;">
     <div style="max-width: 600px; margin: 0 auto; background: white; border-radius: 16px; overflow: hidden; box-shadow: 0 4px 12px rgba(0,0,0,0.05);">
       <div style="background: #1c1c1e; color: white; padding: 24px; text-align: center;">
-        <h1 style="margin: 0; font-size: 1.5rem;">🛍️ Mwecheche</h1>
+        <h1 style="margin: 0; font-size: 1.5rem;">🛍️ Mwechestore</h1>
       </div>
       <div style="padding: 32px 24px; color: #1c1c1e; line-height: 1.6;">
         ${content}
       </div>
       <div style="background: #f9f9f8; padding: 16px; text-align: center; color: #666; font-size: 0.75rem; border-top: 1px solid #eee;">
-        © ${new Date().getFullYear()} Mwecheche — All rights reserved.<br>
+        © ${new Date().getFullYear()} Mwechestore — All rights reserved.<br>
         <a href="${FRONTEND_URL}" style="color: #1c1c1e; text-decoration: none;">${FRONTEND_URL}</a>
       </div>
     </div>
@@ -46,7 +46,7 @@ function emailLayout(content, title = 'Mwecheche') {
 // ========== 1. Welcome Email ==========
 async function sendWelcomeEmail(user) {
   const content = `
-    <h2>🎉 Welcome to Mwecheche, ${user.fullName}!</h2>
+    <h2>🎉 Welcome to Mwechestore, ${user.fullName}!</h2>
     <p>Thank you for creating an account. We're thrilled to have you on board.</p>
     <p>You can now:</p>
     <ul>
@@ -61,7 +61,7 @@ async function sendWelcomeEmail(user) {
   `;
   return sendEmail({
     to: user.email,
-    subject: '🎉 Welcome to Mwecheche!',
+    subject: '🎉 Welcome to Mwechestore!',
     html: emailLayout(content, 'Welcome')
   });
 }

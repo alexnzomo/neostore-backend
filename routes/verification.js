@@ -38,7 +38,7 @@ router.post('/send-verification', async (req, res) => {
   try {
     await sendEmail({
       to: email,
-      subject: 'Your Mwecheche Verification Code',
+      subject: 'Your Mwechestore Verification Code',
       html: `<p>Your verification code is: <strong>${otp}</strong></p><p>This code expires in 5 minutes.</p>`
     });
     console.log(`[send-verification] Email sent to ${email}`);
@@ -90,7 +90,7 @@ router.post('/send-verification-generic', async (req, res) => {
   try {
     await sendEmail({
       to: email,
-      subject: 'Your Mwecheche Verification Code',
+      subject: 'Your Mwechestore Verification Code',
       html: `<p>Your verification code is: <strong>${otp}</strong></p><p>This code expires in 5 minutes.</p>`
     });
     res.json({ success: true });
@@ -137,7 +137,7 @@ router.post('/send-reset-code', async (req, res) => {
   try {
     await sendEmail({
       to: email,
-      subject: 'Reset Your Mwecheche Password',
+      subject: 'Reset Your Mwechestore Password',
       html: `<p>Your password reset code is: <strong>${otp}</strong></p><p>This code expires in 5 minutes.</p>`
     });
     res.json({ success: true });

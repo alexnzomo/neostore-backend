@@ -265,6 +265,88 @@ router.post(
       }
       // ===== END KYC ENFORCEMENT =====
 
+      // ===== DYNAMIC SHIPPING =====
+      //const shippingSettings = await Settings.findOne({ key: 'shipping_rates' });
+      //const rates = shippingSettings ? shippingSettings.value : {
+      //  delivery_region_fees: { default: 600 },
+      //  pickup_region_fees: { default: 100 },
+      //  volume_surcharges: { small: 0, medium: 150, large: 350 }
+      // };
+
+      //let shippingFeeKES = 0;
+      //const zone = req.body.zone || 'default';
+
+      //if (deliveryInfo.type === 'pickup') {
+      //  const regionFee = rates.pickup_region_fees?.[zone] || rates.pickup_region_fees?.default || 100;
+      //  shippingFeeKES = regionFee; // No volume surcharge for pickup (customer does last mile)
+      //} else {
+      //  const regionFee = rates.delivery_region_fees?.[zone] || rates.delivery_region_fees?.default || 600;
+      //  // Sum surcharges per item × quantity
+        //let totalSurcharge = 0;
+        //for (const item of items) {
+        //  const product = await Product.findById(item.productId);
+        //  if (product && product.volumeCategory) {
+        //    const surcharge = rates.volume_surcharges?.[product.volumeCategory] || 0;
+        //    totalSurcharge += surcharge * item.quantity;
+        //  }
+        //}
+        //shippingFeeKES = regionFee + totalSurcharge;
+      //}
+      // ===== END DYNAMIC SHIPPING =====
+
+      // ===== PER‑VENDOR SHIPPING =====
+      const shippingSettings = await Settings.findOne({ key: 'shipping_rates' });
+      const rates = shippingSettings && typeof shippingSettings.value === 'object'
+        ? shippingSettings.value
+        : {
+            delivery_region_fees: { default: 600 },
+            pickup_region_fees: { default: 100 },
+            volume_surcharges: { small: 0, medium: 150, large: 350 }
+          };
+
+      let shippingFeeKES = 0;
+      const zone = req.body.zone || 'default';
+
+      if (deliveryInfo.type === 'pickup') {
+        // Pickup: single fee for the whole order
+        const regionFee = rates.pickup_region_fees?.[zone] || rates.pickup_region_fees?.default || 100;
+        shippingFeeKES = regionFee;
+      } else {
+        // Delivery: calculate shipping per vendor and sum
+        const vendorGroups = {};
+
+        // Group items by vendor
+        for (const item of items) {
+          const product = await Product.findById(item.productId);
+          const vendorId = product.vendorId.toString();
+          if (!vendorGroups[vendorId]) vendorGroups[vendorId] = [];
+          vendorGroups[vendorId].push({ ...item, product });
+        }
+
+        const regionFee = rates.delivery_region_fees?.[zone] || rates.delivery_region_fees?.default || 600;
+
+        for (const vendorId in vendorGroups) {
+          const vendorItems = vendorGroups[vendorId];
+          let vendorSurcharge = 0;
+
+          for (const item of vendorItems) {
+            const product = item.product;
+            if (product && product.volumeCategory) {
+              const surcharge = rates.volume_surcharges?.[product.volumeCategory] || 0;
+              vendorSurcharge += surcharge * item.quantity;
+            }
+          }
+
+          // Each vendor pays the same region fee + their surcharge
+          shippingFeeKES += regionFee + vendorSurcharge;
+        }
+      }
+      // ===== END PER‑VENDOR SHIPPING =====
+
+      // Recalculate total with dynamic shipping
+      totalKES = subtotalKES - (discountAmountKES || 0) + shippingFeeKES;
+      if (totalKES < 0) totalKES = 0;
+
       let depositPaid = 0;
       let balanceDue = 0;
       let paymentStatus = 'pending';
