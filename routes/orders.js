@@ -304,7 +304,7 @@ router.post(
             volume_surcharges: { small: 0, medium: 150, large: 350 }
           };
 
-      let shippingFeeKES = 0;
+      shippingFeeKES = 0;
       const zone = req.body.zone || 'default';
 
       if (deliveryInfo.type === 'pickup') {
