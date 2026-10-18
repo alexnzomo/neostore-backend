@@ -20,6 +20,7 @@ const orderSchema = new mongoose.Schema({
   mpesaCheckoutRequestId: { type: String, default: null },
   mpesaTransactionId: { type: String, default: null },
   mpesaFailureReason: { type: String, default: null },
+  mpesaAmount: { type: Number, default: null },
   stripePaymentIntentId: { type: String, default: null },
   
   cancellationReason: { type: String, default: null },
@@ -57,7 +58,7 @@ const orderSchema = new mongoose.Schema({
   discountCode: { type: String, default: null },
   shippingFeeKES: { type: Number, default: 0, min: 0 },
   totalKES: { type: Number, required: true, min: 0 },
-  paymentStatus: { type: String, enum: ['pending', 'deposit_paid', 'fully_paid', 'cash_collected', 'refunded'], default: 'pending' },
+  paymentStatus: { type: String, enum: ['pending', 'deposit_paid', 'fully_paid', 'cash_collected', 'payment_failed', 'refunded'], default: 'pending' },
   deliveryStatus: { type: String, enum: ['pending', 'processing', 'shipped', 'out_for_delivery', 'ready_for_pickup', 'delivered', 'cancelled'], default: 'pending' },
   paymentMethod: { 
     type: String, 
@@ -66,6 +67,7 @@ const orderSchema = new mongoose.Schema({
   },
   depositPaid: { type: Number, default: 0, min: 0 },
   balanceDue: { type: Number, default: 0, min: 0 },
+  depositPercentage: { type: Number, default: 0, min: 0, max: 100 },
   cashCollected: { type: Number, default: 0, min: 0 },
   remainingBalance: { type: Number, default: 0, min: 0 },
   // === Manual Payment Verification (Fraud Prevention) ===

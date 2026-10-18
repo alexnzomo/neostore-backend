@@ -8,8 +8,7 @@ const userSchema = new mongoose.Schema({
   phone: {
     type: String,
     unique: true,
-    sparse: true,
-    default: null
+    sparse: true
   },  
   password: { type: String, required: true },
   role: {
@@ -43,13 +42,16 @@ userSchema.methods.comparePassword = async function(candidatePassword) {
 };
 
 userSchema.statics.getNextUserId = async function() {
-  const lastUser = await this.findOne().sort({ userId: -1 });
-  let nextNum = 1001;
-  if (lastUser && lastUser.userId) {
-    const match = lastUser.userId.match(/\d+/);
-    if (match) nextNum = parseInt(match[0]) + 1;
+  const Counter = require('./Counter');
+  const counter = await Counter.findOneAndUpdate(
+    { _id: 'userId' },
+    { $inc: { seq: 1 } },
+    { new: true }
+  );
+  if (!counter) {
+    throw new Error('userId counter not seeded. Ensure seedCounters() ran at startup.');
   }
-  return `USR${nextNum}`;
+  return `USR${counter.seq}`;
 };
 
 module.exports = mongoose.model('User', userSchema);

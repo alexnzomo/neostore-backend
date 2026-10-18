@@ -14,31 +14,52 @@ const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
 async function cancelOrder(orderId, reason = 'Order cancelled', userId = null) {
   const order = await Order.findById(orderId);
   if (!order) throw new Error('Order not found');
-  if (order.deliveryStatus === 'cancelled') throw new Error('Order already cancelled');
-  if (['delivered', 'shipped'].includes(order.deliveryStatus)) {
-    throw new Error('Cannot cancel order that is already shipped or delivered');
+
+  // Atomic claim: only the first caller gets the doc.
+  const claimed = await Order.findOneAndUpdate(
+    {
+      _id: orderId,
+      deliveryStatus: { $nin: ['cancelled', 'delivered', 'shipped'] }
+    },
+    {
+      $set: {
+        deliveryStatus: 'cancelled',
+        cancellationReason: reason,
+        cancelledBy: userId || order.customerId,
+        updatedAt: Date.now()
+      }
+    },
+    { new: true }
+  );
+
+  if (!claimed) {
+    if (order.deliveryStatus === 'cancelled') throw new Error('Order already cancelled');
+    if (['delivered', 'shipped'].includes(order.deliveryStatus)) {
+      throw new Error('Cannot cancel order that is already shipped or delivered');
+    }
+    throw new Error('Could not cancel order');
   }
 
-  // Restock items
-  for (const item of order.items) {
+  // Restock — reached only by the winner
+  for (const item of claimed.items) {
     await Product.updateOne({ _id: item.productId }, { $inc: { stock: item.quantity } });
   }
 
-  // Process refund
-  await processRefund(order);
+  await processRefund(claimed);
 
-  // Update order
-  order.deliveryStatus = 'cancelled';
-  order.paymentStatus = 'refunded';
-  order.cancellationReason = reason;
-  order.cancelledBy = userId || order.customerId;
-  order.updatedAt = Date.now();
-  await order.save();
+  // Set payment status based on what was actually collected.
+  // Never-paid orders keep their existing status; paid ones become refunded.
+  const refundable = (claimed.depositPaid || 0) + (claimed.cashCollected || 0);
+  const newPaymentStatus = refundable > 0 ? 'refunded' : claimed.paymentStatus;
+  await Order.updateOne(
+    { _id: claimed._id },
+    { $set: { paymentStatus: newPaymentStatus, updatedAt: Date.now() } }
+  );
+  claimed.paymentStatus = newPaymentStatus;
 
-  // Remove settlement
-  await Settlement.deleteMany({ orderId: order._id });
+  await Settlement.deleteMany({ orderId: claimed._id });
 
-  return order;
+  return claimed;
 }
 
 /**
@@ -47,11 +68,17 @@ async function cancelOrder(orderId, reason = 'Order cancelled', userId = null) {
 async function processRefund(order) {
   if (order.paymentStatus === 'refunded') return;
 
-  // 1. Wallet payment – credit customer's wallet
-  if (order.paymentMethod === 'wallet') {
+  // Refund only what was actually collected.
+  const refundableAmount = (order.depositPaid || 0) + (order.cashCollected || 0);
+  if (refundableAmount <= 0) {
+    return; // Nothing was paid — nothing to refund.
+  }
+
+  // 1. Wallet — credit the exact collected amount
+  if (['wallet', 'wallet_deposit'].includes(order.paymentMethod)) {
     await WalletService.credit(
       order.customerId,
-      order.totalKES,
+      refundableAmount,
       `Refund for cancelled order #${order.orderId}`,
       order._id,
       'refund'
@@ -59,49 +86,45 @@ async function processRefund(order) {
     return;
   }
 
-  // 2. Stripe card payment
+  // 2. Stripe card — refund the exact collected amount
   if (['card', 'card_deposit'].includes(order.paymentMethod)) {
     if (order.stripePaymentIntentId) {
       try {
         const refund = await stripe.refunds.create({
           payment_intent: order.stripePaymentIntentId,
-          amount: Math.round(order.totalKES),
+          amount: Math.round(refundableAmount),
         });
         if (refund.status !== 'succeeded') {
           console.warn(`Stripe refund for order ${order.orderId} returned status: ${refund.status}`);
         }
       } catch (err) {
         console.error(`Stripe refund failed for order ${order.orderId}:`, err.message);
-        // Continue – admin can manually refund.
       }
     }
+    return;
   }
 
-  // 3. M‑Pesa – log and skip (manual reversal required)
+  // 3. M-Pesa — notify admins for manual reversal
   if (['mpesa', 'mpesa_deposit'].includes(order.paymentMethod)) {
     console.log(`M-Pesa refund for order ${order.orderId} (TXN: ${order.mpesaTransactionId}) requires manual processing.`);
-    
-    // ===== ADMIN NOTIFICATION =====
+
     const User = require('../models/User');
     const { createNotification } = require('./notifications');
-    
-    // Get all admins and owners
+
     const admins = await User.find({ role: { $in: ['admin', 'owner'] } });
-    
-    // Send notification to each admin
     for (const admin of admins) {
       await createNotification(
         admin._id,
         'system',
         '⚠️ M‑Pesa Refund Required',
-        `Order #${order.orderId} (TXN: ${order.mpesaTransactionId}) needs manual reversal in the M‑Pesa portal.`,
+        `Order #${order.orderId} (TXN: ${order.mpesaTransactionId}) needs manual reversal in the M‑Pesa portal. Refund amount: KES ${refundableAmount.toFixed(0)}.`,
         '/admin.html?tab=orders'
       );
     }
-    // ===== END ADMIN NOTIFICATION =====
+    return;
   }
 
-  // 4. Cash – no online refund; admin handles manually.
+  // 4. Cash — admin handles manually, no online refund.
 }
 
 module.exports = { cancelOrder, processRefund };

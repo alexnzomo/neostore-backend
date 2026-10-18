@@ -4,6 +4,7 @@ const PickupStation = require('../models/PickupStation');
 const { protect } = require('../middleware/auth');
 const { allowRoles } = require('../middleware/roleCheck');
 const User = require('../models/User');
+const { createNotification } = require('../utils/notifications');
 
 const router = express.Router();
 
@@ -40,48 +41,91 @@ router.get('/pending', protect, allowRoles('admin', 'owner'), async (req, res) =
 
 // Approve or reject application (admin/owner)
 router.put('/:id', protect, allowRoles('admin', 'owner'), async (req, res) => {
-  const { status } = req.body; // 'approved' or 'rejected'
-  const application = await PickupApplication.findById(req.params.id);
-  if (!application) return res.status(404).json({ error: 'Not found' });
-  if (application.status !== 'pending') return res.status(400).json({ error: 'Already processed' });
-
-  if (status === 'approved') {
-    // 🔴 NEW: Check if the user already manages a station
-    const existingStation = await PickupStation.findOne({ managerId: application.userId });
-    if (existingStation) {
-      return res.status(400).json({
-        error: `User already manages a station: ${existingStation.name}. Please unassign them first.`
-      });
+  try {
+    const { status } = req.body;
+    if (!['approved', 'rejected'].includes(status)) {
+      return res.status(400).json({ error: 'Status must be approved or rejected' });
     }
 
-    // Create the pickup station
-    const newStation = new PickupStation({
-      name: application.stationName,
-      address: application.address,
-      city: application.city,
-      county: application.county,
-      phone: application.phone,
-      email: application.email || '',
-      hours: application.hours || '',
-      managerId: application.userId,
-      approvedBy: req.user._id,
-      approvedAt: new Date()
-    });
-    await newStation.save();
+    // Pre-check if approving (best effort — re-checked atomically below)
+    if (status === 'approved') {
+      const pendingApp = await PickupApplication.findById(req.params.id);
+      if (!pendingApp) return res.status(404).json({ error: 'Not found' });
+      const existingStation = await PickupStation.findOne({ managerId: pendingApp.userId });
+      if (existingStation) {
+        return res.status(400).json({
+          error: `User already manages a station: ${existingStation.name}. Please unassign them first.`
+        });
+      }
+    }
 
-    // Update the user's role and stationId
-    await User.findByIdAndUpdate(application.userId, {
-      role: 'station_manager',
-      stationId: newStation._id
-    });
+    // Atomic claim
+    const application = await PickupApplication.findOneAndUpdate(
+      { _id: req.params.id, status: 'pending' },
+      { $set: { status, reviewedBy: req.user._id, reviewedAt: new Date() } },
+      { new: true }
+    );
+
+    if (!application) {
+      const existing = await PickupApplication.findById(req.params.id);
+      if (!existing) return res.status(404).json({ error: 'Not found' });
+      return res.status(400).json({ error: 'Already processed' });
+    }
+
+    if (status === 'approved') {
+      // Re-check after claim to close the race window
+      const racingStation = await PickupStation.findOne({ managerId: application.userId });
+      if (racingStation) {
+        // Undo our claim
+        await PickupApplication.findByIdAndUpdate(application._id, {
+          $set: { status: 'pending', reviewedBy: null, reviewedAt: null }
+        });
+        return res.status(400).json({
+          error: `User already manages a station: ${racingStation.name}. Please unassign them first.`
+        });
+      }
+
+      const newStation = new PickupStation({
+        name: application.stationName,
+        address: application.address,
+        city: application.city,
+        county: application.county,
+        phone: application.phone,
+        email: application.email || '',
+        hours: application.hours || '',
+        managerId: application.userId,
+        approvedBy: req.user._id,
+        approvedAt: new Date()
+      });
+      await newStation.save();
+
+      await User.findByIdAndUpdate(application.userId, {
+        role: 'station_manager',
+        stationId: newStation._id
+      });
+
+      await createNotification(
+        application.userId,
+        'system',
+        '✅ Pickup Station Approved',
+        `Your application for "${application.stationName}" has been approved. You are now a station manager.`,
+        '/station_manager.html'
+      );
+    } else {
+      await createNotification(
+        application.userId,
+        'system',
+        '❌ Pickup Station Rejected',
+        `Your application for "${application.stationName}" was not approved.`,
+        '/account.html'
+      );
+    }
+
+    res.json({ message: `Application ${status}` });
+  } catch (err) {
+    console.error('Pickup application update error:', err);
+    res.status(500).json({ error: err.message });
   }
-
-  application.status = status;
-  application.reviewedBy = req.user._id;
-  application.reviewedAt = new Date();
-  await application.save();
-
-  res.json({ message: `Application ${status}` });
 });
 
 module.exports = router;

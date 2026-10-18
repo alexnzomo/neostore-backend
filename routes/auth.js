@@ -27,6 +27,10 @@ router.post(
       .optional({ nullable: true, checkFalsy: true })
       .isAlphanumeric()
       .withMessage('Referral code must be alphanumeric'),
+    body('code')
+      .notEmpty().withMessage('Verification code required')
+      .isLength({ min: 6, max: 6 }).withMessage('Verification code must be 6 digits')
+      .isNumeric().withMessage('Verification code must be numeric'),
     // ✅ NEW: Phone validation (optional but unique if provided)
     body('phone')
       .optional({ nullable: true, checkFalsy: true })
@@ -46,7 +50,18 @@ router.post(
       return res.status(400).json({ errors: errors.array() });
     }
 
-    const { fullName, email, password, referralCode: inputReferralCode, phone } = req.body;
+    const { fullName, email, password, referralCode: inputReferralCode, phone, code } = req.body;
+
+    // 0. Verify the email verification code
+    const Otp = require('../models/Otp');
+    const otpDoc = await Otp.findOne({ email, otp: code });
+    if (!otpDoc) {
+      return res.status(400).json({ error: 'Invalid or expired verification code. Please request a new one.' });
+    }
+    if (otpDoc.expiresAt < new Date()) {
+      await Otp.deleteOne({ _id: otpDoc._id });
+      return res.status(400).json({ error: 'Verification code expired. Please request a new one.' });
+    }
 
     // 1. Check if email already registered
     const existingUser = await User.findOne({ email });
@@ -63,8 +78,19 @@ router.post(
 
     // 3. Create user
     const userId = await User.getNextUserId();
-    // ✅ Include phone in the new user
-    const newUser = new User({ userId, fullName, email, password, phone: phone || null, referredBy, emailVerified: true });
+    // ✅ Only set phone if a non-empty value was provided.
+    // Setting phone to null breaks the sparse unique index (two null phones collide).
+    const newUser = new User({
+      userId,
+      fullName,
+      email,
+      password,
+      referredBy,
+      emailVerified: true
+    });
+    if (phone && String(phone).trim()) {
+      newUser.phone = String(phone).trim();
+    }
 
     // 4. Generate a unique referral code for the new user
     let referralCode = generateReferralCode();
@@ -74,6 +100,9 @@ router.post(
     newUser.referralCode = referralCode;
 
     await newUser.save();
+
+    // Consume the OTP only after user creation succeeds
+    await Otp.deleteOne({ _id: otpDoc._id });
 
     // 5. Send welcome email (non‑blocking)
     try {
@@ -171,7 +200,7 @@ router.get('/me', protect, async (req, res) => {
 });
 
 // GET /api/auth/csrf-token
-router.get('/csrf-token', protect, async (req, res) => {
+router.get('/csrf-token', async (req, res) => { //removed protect middleware to allow unauthenticated users to get CSRF token
   try {
     let token = req.cookies.csrfToken;
     if (!token) {

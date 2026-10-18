@@ -14,7 +14,7 @@ const router = express.Router();
 // Get all users (admin/owner only) – PAGINATED
 router.get('/', protect, allowRoles('admin', 'owner'), async (req, res) => {
   try {
-    const limit = parseInt(req.query.limit) || 50;
+    const limit = Math.min(parseInt(req.query.limit) || 50, 200);
     const skip = parseInt(req.query.skip) || 0;
     
     const [users, total] = await Promise.all([
@@ -216,6 +216,28 @@ router.delete('/:id', protect, allowRoles('owner'), async (req, res) => {
     const user = await User.findById(req.params.id);
     if (!user) return res.status(404).json({ error: 'User not found' });
     if (user.role === 'owner') return res.status(403).json({ error: 'Cannot delete the owner' });
+
+    // Refuse if the user has active orders (as customer or agent).
+    // Otherwise orders keep a dangling customerId / assignedAgentId,
+    // which shows as blank names on the admin dashboard and undercounts reports.
+    const Order = require('../models/Order');
+    const activeOrders = await Order.countDocuments({
+      $or: [{ customerId: user._id }, { assignedAgentId: user._id }],
+      deliveryStatus: { $nin: ['delivered', 'cancelled'] }
+    });
+    if (activeOrders > 0) {
+      return res.status(400).json({
+        error: `User has ${activeOrders} active order(s). Resolve or reassign them first.`
+      });
+    }
+
+    // Refuse if the user is a station manager still attached to a station.
+    if (user.stationId) {
+      return res.status(400).json({
+        error: 'User is a station manager. Unassign them from their station first.'
+      });
+    }
+
     await user.deleteOne();
     await logAction(req, 'delete_user', user._id, { deletedUser: user.email });
     res.json({ message: 'User deleted' });
@@ -224,20 +246,41 @@ router.delete('/:id', protect, allowRoles('owner'), async (req, res) => {
   }
 });
 
-// Reset password (public, after code verification) – already sanitized in auth.js
+// Reset password — verifies OTP in the SAME request
 router.post('/reset-password', async (req, res) => {
-  const { email, newPassword } = req.body;
-  if (!email || !newPassword) {
-    return res.status(400).json({ error: 'Email and new password required' });
+  const { email, newPassword, code } = req.body;
+
+  if (!email || !newPassword || !code) {
+    return res.status(400).json({ error: 'Email, new password, and reset code are required' });
   }
   if (newPassword.length < 6) {
     return res.status(400).json({ error: 'Password must be at least 6 characters' });
   }
+
   try {
-    const user = await User.findOne({ email });
-    if (!user) return res.status(404).json({ error: 'User not found' });
+    const Otp = require('../models/Otp');
+    const normalizedEmail = email.trim().toLowerCase();
+
+    const otpDoc = await Otp.findOne({ email: normalizedEmail, otp: code });
+    if (!otpDoc) {
+      return res.status(400).json({ error: 'Invalid or expired reset code' });
+    }
+    if (otpDoc.expiresAt < new Date()) {
+      await Otp.deleteOne({ _id: otpDoc._id });
+      return res.status(400).json({ error: 'Reset code expired. Please request a new one.' });
+    }
+
+    const user = await User.findOne({ email: normalizedEmail });
+    if (!user) {
+      await Otp.deleteOne({ _id: otpDoc._id });
+      return res.status(404).json({ error: 'User not found' });
+    }
+
     user.password = newPassword;
     await user.save();
+
+    await Otp.deleteOne({ _id: otpDoc._id });
+
     res.json({ success: true });
   } catch (err) {
     res.status(500).json({ error: err.message });

@@ -29,13 +29,16 @@ const productSchema = new mongoose.Schema({
 
 // Auto-increment productId (PRD1001, PRD1002, ...)
 productSchema.statics.getNextProductId = async function() {
-  const lastProduct = await this.findOne().sort({ productId: -1 });
-  let nextNum = 1001;
-  if (lastProduct && lastProduct.productId) {
-    const match = lastProduct.productId.match(/\d+/);
-    if (match) nextNum = parseInt(match[0]) + 1;
+  const Counter = require('./Counter');
+  const counter = await Counter.findOneAndUpdate(
+    { _id: 'productId' },
+    { $inc: { seq: 1 } },
+    { new: true }
+  );
+  if (!counter) {
+    throw new Error('productId counter not seeded. Ensure seedCounters() ran at startup.');
   }
-  return `PRD${nextNum}`;
+  return `PRD${counter.seq}`;
 };
 
 module.exports = mongoose.model('Product', productSchema);

@@ -3,7 +3,8 @@ const mongoose = require('mongoose');
 
 const settingsSchema = new mongoose.Schema({
   key: { type: String, required: true, unique: true },
-  value: { type: Number, required: true }
+  value: { type: mongoose.Schema.Types.Mixed, required: true }
+  //value: { type: Number, required: true }
 });
 
 // Pre-populate default values if needed

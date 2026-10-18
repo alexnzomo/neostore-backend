@@ -289,6 +289,7 @@ router.get('/shipping-rates', async (req, res) => {
       default: 600
     },
     pickup_region_fees: {
+      'Zone 0': 100,
       'Zone 1': 100,
       'Zone 2': 150,
       'Zone 3': 200,
@@ -332,10 +333,84 @@ router.put('/shipping-rates', protect, allowRoles('owner'), async (req, res) => 
   res.json({ success: true, rates });
 });
 
+// ========== Withdrawal Fee Structure ==========
+router.get('/withdrawalFeeFlat', async (req, res) => {
+  const value = await getSetting('withdrawalFeeFlat');
+  res.json({ value: value !== null ? value : 30 });
+});
+
+router.put('/withdrawalFeeFlat', protect, allowRoles('owner'), async (req, res) => {
+  const { value } = req.body;
+  if (value === undefined || value < 0) return res.status(400).json({ error: 'Value must be >= 0' });
+  await Settings.findOneAndUpdate(
+    { key: 'withdrawalFeeFlat' },
+    { key: 'withdrawalFeeFlat', value },
+    { upsert: true, new: true }
+  );
+  res.json({ success: true, value });
+});
+
+router.get('/withdrawalFeePercentage', async (req, res) => {
+  const value = await getSetting('withdrawalFeePercentage');
+  res.json({ value: value !== null ? value : 1 });
+});
+
+router.put('/withdrawalFeePercentage', protect, allowRoles('owner'), async (req, res) => {
+  const { value } = req.body;
+  if (value === undefined || value < 0 || value > 100) {
+    return res.status(400).json({ error: 'Value must be between 0 and 100' });
+  }
+  await Settings.findOneAndUpdate(
+    { key: 'withdrawalFeePercentage' },
+    { key: 'withdrawalFeePercentage', value },
+    { upsert: true, new: true }
+  );
+  res.json({ success: true, value });
+});
+
+router.get('/withdrawalFeeThreshold', async (req, res) => {
+  const value = await getSetting('withdrawalFeeThreshold');
+  res.json({ value: value !== null ? value : 10000 });
+});
+
+router.put('/withdrawalFeeThreshold', protect, allowRoles('owner'), async (req, res) => {
+  const { value } = req.body;
+  if (value === undefined || value < 0) return res.status(400).json({ error: 'Value must be >= 0' });
+  await Settings.findOneAndUpdate(
+    { key: 'withdrawalFeeThreshold' },
+    { key: 'withdrawalFeeThreshold', value },
+    { upsert: true, new: true }
+  );
+  res.json({ success: true, value });
+});
+
 // ========== Generic setting getter (fallback – keep LAST) ==========
+// Only public settings are exposed. Anything else returns 403 to prevent
+// leaking internal config to any logged-in or anonymous user.
+const PUBLIC_SETTINGS = new Set([
+  'global_commission',
+  'deposit_percentage',
+  'agent-delivery-fee',
+  'station-pickup-fee',
+  'cash-enabled',
+  'cash-max-per-order',
+  'cash-max-per-agent-per-day',
+  'shipping-rates',
+  'stripe-publishable-key',
+  'withdrawalFeeFlat',
+  'withdrawalFeePercentage',
+  'withdrawalFeeThreshold',
+  'sponsorship-fee',
+  'kyc-order-threshold',
+  'kyc-required-for-delivery'
+]);
+
 router.get('/:key', async (req, res) => {
   try {
     const { key } = req.params;
+    if (!PUBLIC_SETTINGS.has(key)) {
+      return res.status(403).json({ error: 'Not allowed' });
+    }
     const value = await getSetting(key);
     res.json({ key, value: value || 0 });
   } catch (err) {

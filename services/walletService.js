@@ -8,6 +8,15 @@ class WalletService {
     return crypto.randomBytes(16).toString('hex');
   }
 
+  /**
+   * Build a deterministic key so a retried operation returns the
+   * same transaction instead of crediting/debiting twice.
+   */
+  static buildDeterministicKey(referenceType, referenceId, operation) {
+    if (!referenceType || !referenceId) return null;
+    return `${referenceType}:${referenceId}:${operation}`;
+  }
+
   static async getBalance(userId, session = null) {
     const user = await User.findById(userId).select('walletBalance').session(session);
     return user ? user.walletBalance : 0;
@@ -15,7 +24,21 @@ class WalletService {
 
   static async credit(userId, amount, description, referenceId = null, referenceType = null, metadata = {}) {
     if (amount <= 0) throw new Error('Amount must be positive');
-    const idempotencyKey = this.generateIdempotencyKey();
+
+    const deterministicKey = this.buildDeterministicKey(referenceType, referenceId, 'credit');
+    if (deterministicKey) {
+      const existing = await WalletTransaction.findOne({ idempotencyKey: deterministicKey });
+      if (existing) {
+        return {
+          success: true,
+          newBalance: existing.balanceAfter,
+          transaction: existing,
+          alreadyApplied: true
+        };
+      }
+    }
+
+    const idempotencyKey = deterministicKey || this.generateIdempotencyKey();
     const session = await mongoose.startSession();
     session.startTransaction();
 
@@ -54,7 +77,21 @@ class WalletService {
 
   static async debit(userId, amount, description, referenceId = null, referenceType = null, metadata = {}) {
     if (amount <= 0) throw new Error('Amount must be positive');
-    const idempotencyKey = this.generateIdempotencyKey();
+
+    const deterministicKey = this.buildDeterministicKey(referenceType, referenceId, 'debit');
+    if (deterministicKey) {
+      const existing = await WalletTransaction.findOne({ idempotencyKey: deterministicKey });
+      if (existing) {
+        return {
+          success: true,
+          newBalance: existing.balanceAfter,
+          transaction: existing,
+          alreadyApplied: true
+        };
+      }
+    }
+
+    const idempotencyKey = deterministicKey || this.generateIdempotencyKey();
     const session = await mongoose.startSession();
     session.startTransaction();
 

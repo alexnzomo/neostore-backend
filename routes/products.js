@@ -30,8 +30,13 @@ async function initiateMpesaPayment(phoneNumber, amount, orderId) {
   const CALLBACK_URL = process.env.CALLBACK_URL || 'https://your-ngrok-url.ngrok.io/callback';
 
   const auth = Buffer.from(`${CONSUMER_KEY}:${CONSUMER_SECRET}`).toString('base64');
+  const MPESA_BASE_URL = process.env.MPESA_BASE_URL
+    || (process.env.NODE_ENV === 'production'
+      ? 'https://api.safaricom.co.ke'
+      : 'https://sandbox.safaricom.co.ke');
+
   const tokenRes = await axios.get(
-    'https://sandbox.safaricom.co.ke/oauth/v1/generate?grant_type=client_credentials',
+    `${MPESA_BASE_URL}/oauth/v1/generate?grant_type=client_credentials`,
     { headers: { Authorization: `Basic ${auth}` } }
   );
   const token = tokenRes.data.access_token;
@@ -44,7 +49,7 @@ async function initiateMpesaPayment(phoneNumber, amount, orderId) {
   const password = Buffer.from(SHORTCODE + PASSKEY + timestamp).toString('base64');
 
   const response = await axios.post(
-    'https://sandbox.safaricom.co.ke/mpesa/stkpush/v1/processrequest',
+    `${MPESA_BASE_URL}/mpesa/stkpush/v1/processrequest`,
     {
       BusinessShortCode: SHORTCODE,
       Password: password,

@@ -76,26 +76,26 @@ async function createSettlementsForOrder(order) {
     const vendorEarningsKES = (data.subtotalUSD - data.totalCommissionUSD) * 130;
     const platformCommissionKES = data.totalCommissionUSD * 130;
 
-    let settlement = await Settlement.findOne({
-      orderId: order._id,
-      vendorId: data.vendorId
-    });
-    if (settlement) continue;
-
-    settlement = new Settlement({
-      orderId: order._id,
-      vendorId: data.vendorId,
-      agentId: order.assignedAgentId,
-      stationId: isPickup ? order.deliveryInfo.stationId : null,
-      vendorEarnings: vendorEarningsKES,
-      agentEarnings: agentEarnings,
-      stationEarnings: stationEarnings,
-      platformCommission: platformCommissionKES,
-      vendorPaid: false,
-      agentPaid: false,
-      stationPaid: false
-    });
-    await settlement.save();
+    // Idempotent upsert — safe against concurrent triggers.
+    const settlement = await Settlement.findOneAndUpdate(
+      { orderId: order._id, vendorId: data.vendorId },
+      {
+        $setOnInsert: {
+          orderId: order._id,
+          vendorId: data.vendorId,
+          agentId: order.assignedAgentId,
+          stationId: isPickup ? order.deliveryInfo.stationId : null,
+          vendorEarnings: vendorEarningsKES,
+          agentEarnings: agentEarnings,
+          stationEarnings: stationEarnings,
+          platformCommission: platformCommissionKES,
+          vendorPaid: false,
+          agentPaid: false,
+          stationPaid: false
+        }
+      },
+      { upsert: true, new: true, setDefaultsOnInsert: true }
+    );
     settlements.push(settlement);
   }
   return settlements;
@@ -103,13 +103,13 @@ async function createSettlementsForOrder(order) {
 
 // ========== Routes ==========
 
-// Get all orders (admin, owner, station_manager) – PAGINATED
-router.get('/', protect, allowRoles('admin', 'owner', 'station_manager'), async (req, res) => {
+// Get orders (role-scoped) – PAGINATED
+router.get('/', protect, allowRoles('admin', 'owner', 'station_manager', 'agent'), async (req, res) => {
   try {
     const limit = parseInt(req.query.limit) || 50;
     const skip = parseInt(req.query.skip) || 0;
-    
-    let query = {};
+
+    const query = {};
 
     // ----  search filter ----
     if (req.query.search) {
@@ -123,15 +123,20 @@ router.get('/', protect, allowRoles('admin', 'owner', 'station_manager'), async 
         { manualPaymentReference: { $regex: search, $options: 'i' } }
       ];
     }
-    // ---- End search filter ----    
-    
+    // ---- End search filter ----
+
     if (req.user.role === 'station_manager') {
       const user = await User.findById(req.user._id).select('stationId');
       if (user && user.stationId) {
-        query = { 'deliveryInfo.type': 'pickup', 'deliveryInfo.stationId': user.stationId };
+        // Merge with search filter (do NOT replace)
+        query['deliveryInfo.type'] = 'pickup';
+        query['deliveryInfo.stationId'] = user.stationId;
       } else {
         return res.json({ orders: [], total: 0, limit, skip });
       }
+    } else if (req.user.role === 'agent') {
+      // Agents only see orders assigned to them
+      query.assignedAgentId = req.user._id;
     }
     
     const [orders, total] = await Promise.all([
@@ -180,9 +185,25 @@ router.post(
         idempotencyKey
       } = req.body;
 
+      // Re-validate discount server-side; ignore any client-sent amount.
+      let validatedDiscountAmountKES = 0;
+      if (discountCode) {
+        try {
+          const Discount = require('../models/Discount');
+          const discount = await Discount.findOne({ code: String(discountCode).toUpperCase() });
+          if (discount) {
+            const expired = discount.expiry && new Date(discount.expiry) < new Date();
+            // subtotal will be computed below — validate after we know it
+            // For now, just remember we have a discount to check.
+            // (We'll compute the amount after subtotal is known.)
+            validatedDiscountAmountKES = { discount }; // temporary holder
+          }
+        } catch (e) { /* ignore */ }
+      }
       if (discountAmountKES !== undefined && discountAmountKES < 0) {
         return res.status(400).json({ error: 'Discount amount cannot be negative' });
       }
+      
       if (depositPercentage !== undefined && (depositPercentage < 0 || depositPercentage > 100)) {
         return res.status(400).json({ error: 'Deposit percentage must be between 0 and 100' });
       }
@@ -206,13 +227,16 @@ router.post(
       }
 
       // Resolve pickup station
-      if (deliveryInfo.type === 'pickup' && deliveryInfo.stationName) {
+      if (deliveryInfo.type === 'pickup') {
+        if (!deliveryInfo.stationName) {
+          return res.status(400).json({ error: 'Pickup station is required for pickup orders' });
+        }
         const station = await PickupStation.findOne({ name: deliveryInfo.stationName });
-        if (station) {
-          deliveryInfo.stationId = station._id;
-        } else {
+        if (!station) {
           return res.status(400).json({ error: 'Pickup station not found' });
         }
+        deliveryInfo.stationId = station._id;
+        deliveryInfo.stationName = station.name;
       }
 
       // Calculate totals
@@ -231,7 +255,7 @@ router.post(
           return res.status(400).json({ error: `Product ${product.name} has an invalid price` });
         }
         subtotalUSD += effectivePrice * item.quantity;
-        shippingFeeKES += (product.shippingFee || 100) * item.quantity;
+        //shippingFeeKES += (product.shippingFee || 100) * item.quantity;
         orderItems.push({
           productId: product._id,
           name: product.name,
@@ -241,7 +265,30 @@ router.post(
       }
 
       const subtotalKES = subtotalUSD * 130;
-      let totalKES = subtotalKES - (discountAmountKES || 0) + shippingFeeKES;
+
+      // Resolve discount server-side
+      let finalDiscountAmount = 0;
+      let finalDiscountCode = null;
+      if (discountCode) {
+        try {
+          const Discount = require('../models/Discount');
+          const discount = await Discount.findOne({ code: String(discountCode).toUpperCase() });
+          if (discount) {
+            const expired = discount.expiry && new Date(discount.expiry) < new Date();
+            const meetsMin = !discount.minOrder || subtotalKES >= discount.minOrder;
+            if (!expired && meetsMin) {
+              if (discount.type === 'percentage') {
+                finalDiscountAmount = Math.round(subtotalKES * (discount.value / 100));
+              } else {
+                finalDiscountAmount = Math.min(discount.value, subtotalKES);
+              }
+              finalDiscountCode = discount.code;
+            }
+          }
+        } catch (e) { /* invalid code → no discount */ }
+      }
+
+      let totalKES = subtotalKES - finalDiscountAmount + shippingFeeKES;
       if (totalKES < 0) totalKES = 0;
 
       // ===== KYC ENFORCEMENT (INSERTED HERE) =====
@@ -348,19 +395,19 @@ router.post(
       if (totalKES < 0) totalKES = 0;
 
       let depositPaid = 0;
-      let balanceDue = 0;
+      let balanceDue = totalKES;
       let paymentStatus = 'pending';
 
       if (paymentMethod === 'card_deposit' || paymentMethod === 'mpesa_deposit' || paymentMethod === 'wallet_deposit') {
-        depositPaid = totalKES * (depositPercentage / 100);
-        balanceDue = totalKES - depositPaid;
-        paymentStatus = 'deposit_paid';
+        // Deposit amount expected, but not yet collected.
+        // Gateway callback / webhook will set depositPaid + balanceDue.
+        balanceDue = totalKES;
+        paymentStatus = 'pending';
       } else if (paymentMethod === 'card' || paymentMethod === 'mpesa' || paymentMethod === 'wallet') {
-        depositPaid = totalKES;
-        balanceDue = 0;
-        paymentStatus = 'fully_paid';
+        // Full amount expected, but not yet collected.
+        balanceDue = totalKES;
+        paymentStatus = 'pending';
       } else if (paymentMethod === 'cash_on_delivery') {
-        depositPaid = 0;
         balanceDue = totalKES;
         paymentStatus = 'pending';
       } else {
@@ -377,8 +424,8 @@ router.post(
         deliveryInfo,
         items: orderItems,
         subtotalUSD,
-        discountAmountKES: discountAmountKES || 0,
-        discountCode: discountCode || null,
+        discountAmountKES: finalDiscountAmount,
+        discountCode: finalDiscountCode,
         shippingFeeKES,
         totalKES,
         paymentStatus,
@@ -386,28 +433,52 @@ router.post(
         paymentMethod,
         depositPaid,
         balanceDue,
+        depositPercentage: depositPercentage || 0,
         assignedAgentId: null,
         cashCollected: 0,
         remainingBalance: balanceDue,
         idempotencyKey: idempotencyKey || null
       });
 
-      // Deduct stock
-      for (const item of items) {
-        await Product.updateOne({ _id: item.productId }, { $inc: { stock: -item.quantity } });
-      }
-
-      if (req.body.location) {
-        newOrder.location = req.body.location;
-      }
-
-      await newOrder.save();
-      // ✅ Send order confirmation email
+      // === ATOMIC STOCK DECREMENT ===
+      // Guards against overselling (concurrent decrements) and restores stock
+      // if the order save fails afterward (no phantom loss).
+      const deductedItems = [];
       try {
-        await sendOrderConfirmationEmail(newOrder);
-      } catch (err) {
-        console.error('Order confirmation email failed:', err.message);
-      }      
+        for (const item of items) {
+          const result = await Product.updateOne(
+            { _id: item.productId, stock: { $gte: item.quantity } },
+            { $inc: { stock: -item.quantity } }
+          );
+          if (result.modifiedCount === 0) {
+            throw new Error(`Insufficient stock for product ${item.productId}`);
+          }
+          deductedItems.push(item);
+        }
+
+        if (req.body.location) {
+          newOrder.location = req.body.location;
+        }
+
+        await newOrder.save();
+      } catch (saveErr) {
+        // Rollback any stock we already decremented
+        for (const item of deductedItems) {
+          try {
+            await Product.updateOne(
+              { _id: item.productId },
+              { $inc: { stock: item.quantity } }
+            );
+          } catch (rollbackErr) {
+            console.error('Stock rollback failed:', rollbackErr.message);
+          }
+        }
+        throw saveErr;
+      }
+
+      // Order confirmation email is sent by the payment webhook/callback
+      // once the payment is confirmed. Do not send here.
+
       await logAction(req, 'order_created', req.user._id, { orderId: newOrder._id, total: totalKES });
 
       res.status(201).json(newOrder);
@@ -498,10 +569,46 @@ router.get('/:id', protect, async (req, res) => {
   try {
     const order = await Order.findById(req.params.id);
     if (!order) return res.status(404).json({ error: 'Order not found' });
-    if (order.customerId.toString() !== req.user._id.toString() && !['admin', 'owner', 'agent', 'station_manager'].includes(req.user.role)) {
-      return res.status(403).json({ error: 'Not authorized' });
+
+    const userId = req.user._id.toString();
+    const role = req.user.role;
+
+    // Admins/owners see all
+    if (role === 'admin' || role === 'owner') {
+      return res.json(order);
     }
-    res.json(order);
+
+    // Customers see their own
+    if (order.customerId.toString() === userId) {
+      return res.json(order);
+    }
+
+    // Agents only see orders assigned to them
+    if (role === 'agent') {
+      if (order.assignedAgentId && order.assignedAgentId.toString() === userId) {
+        return res.json(order);
+      }
+      return res.status(403).json({ error: 'Not assigned to this order' });
+    }
+
+    // Station managers only see pickup orders at their station
+    if (role === 'station_manager') {
+      const user = await User.findById(req.user._id).select('stationId');
+      const matchesStation =
+        user &&
+        user.stationId &&
+        order.deliveryInfo &&
+        order.deliveryInfo.type === 'pickup' &&
+        order.deliveryInfo.stationId &&
+        order.deliveryInfo.stationId.toString() === user.stationId.toString();
+
+      if (matchesStation) {
+        return res.json(order);
+      }
+      return res.status(403).json({ error: 'Not authorized for this order' });
+    }
+
+    return res.status(403).json({ error: 'Not authorized' });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -527,6 +634,15 @@ router.put(
     try {
       const { deliveryStatus } = req.body;
       const order = await Order.findById(req.params.id);
+
+      // ===== AGENT ASSIGNMENT CHECK =====
+      if (req.user.role === 'agent') {
+        if (!order.assignedAgentId || order.assignedAgentId.toString() !== req.user._id.toString()) {
+          return res.status(403).json({ error: 'You are not assigned to this order' });
+        }
+      }
+      // ===== END CHECK =====
+
       if (!order) return res.status(404).json({ error: 'Order not found' });
 
       if (req.user.role === 'station_manager') {
@@ -535,6 +651,25 @@ router.put(
           return res.status(403).json({ error: 'You can only update pickup orders for your station' });
         }
       }
+
+      // ===== STATUS TRANSITION VALIDATION =====
+      const transitions = {
+        'pending': ['processing', 'ready_for_pickup', 'cancelled'],
+        'processing': ['shipped', 'ready_for_pickup', 'cancelled'],
+        'shipped': ['out_for_delivery', 'delivered', 'cancelled'],
+        'out_for_delivery': ['delivered', 'cancelled'],
+        'ready_for_pickup': ['delivered', 'cancelled'],
+        'delivered': [],
+        'cancelled': []
+      };
+
+      const current = order.deliveryStatus;
+      const next = deliveryStatus;
+      if (current === next) return res.json(order);
+      if (!transitions[current]?.includes(next)) {
+        return res.status(400).json({ error: `Invalid transition from ${current} to ${next}` });
+      }
+      // ===== END TRANSITION VALIDATION =====
 
       order.deliveryStatus = deliveryStatus;
       order.updatedAt = Date.now();
@@ -585,33 +720,48 @@ router.post(
         return res.status(400).json({ error: `Refund only allowed within ${REFUND_DAYS_LIMIT} days of order creation` });
       }
 
-      for (const item of order.items) {
+      // Atomic claim — only one admin can execute the refund.
+      const claimed = await Order.findOneAndUpdate(
+        {
+          _id: order._id,
+          paymentStatus: { $in: ['fully_paid', 'cash_collected', 'deposit_paid'] }
+        },
+        {
+          $set: {
+            paymentStatus: 'refunded',
+            deliveryStatus: 'cancelled',
+            refundReason: reason || 'Refund requested by admin',
+            refundedBy: req.user._id,
+            refundedAt: new Date(),
+            updatedAt: Date.now()
+          }
+        },
+        { new: true }
+      );
+
+      if (!claimed) {
+        return res.status(400).json({ error: 'Order was already refunded by another admin' });
+      }
+
+      // Restock — only reached by the winner
+      for (const item of claimed.items) {
         await Product.updateOne({ _id: item.productId }, { $inc: { stock: item.quantity } });
       }
 
-      await processRefund(order);
+      await processRefund(claimed);
+      await Settlement.deleteMany({ orderId: claimed._id });
 
-      order.paymentStatus = 'refunded';
-      order.deliveryStatus = 'cancelled';
-      order.refundReason = reason || 'Refund requested by admin';
-      order.refundedBy = req.user._id;
-      order.refundedAt = new Date();
-      await order.save();
-
-      await Settlement.deleteMany({ orderId: order._id });
-
-      // Notify customer
       await createNotification(
-        order.customerId,
+        claimed.customerId,
         'system',
         'Refund processed',
-        `Your order #${order.orderId} has been refunded. Reason: ${order.refundReason}`,
+        `Your order #${claimed.orderId} has been refunded. Reason: ${claimed.refundReason}`,
         '/account.html'
       );
 
-      await logAction(req, 'order_refund', order.customerId, { orderId: order._id, amount: order.totalKES });
+      await logAction(req, 'order_refund', claimed.customerId, { orderId: claimed._id, amount: claimed.totalKES });
 
-      res.json({ success: true, order });
+      res.json({ success: true, order: claimed });
     } catch (err) {
       console.error('Refund error:', err);
       res.status(500).json({ error: err.message });
@@ -677,6 +827,15 @@ router.put(
       const verified = req.body.verified === true; // checkbox from frontend
 
       const order = await Order.findById(req.params.id);
+
+      // ===== AGENT ASSIGNMENT CHECK =====
+      if (req.user.role === 'agent') {
+        if (!order.assignedAgentId || order.assignedAgentId.toString() !== req.user._id.toString()) {
+          return res.status(403).json({ error: 'You are not assigned to this order' });
+        }
+      }
+      // ===== END CHECK =====
+
       if (!order) return res.status(404).json({ error: 'Order not found' });
 
       // Station manager permission check
@@ -739,7 +898,7 @@ router.put(
       }
       // ---------- END CASH CHECKS ----------
 
-      // Check remaining balance
+      // Check remaining balance (fast fail before the atomic update)
       if (!order.remainingBalance || order.remainingBalance <= 0) {
         return res.status(400).json({ error: 'No remaining balance to collect' });
       }
@@ -747,23 +906,42 @@ router.put(
         return res.status(400).json({ error: 'Amount exceeds remaining balance' });
       }
 
-      // Update financial fields
-      order.cashCollected += amount;
-      order.remainingBalance -= amount;
-      if (order.remainingBalance === 0) {
-        order.paymentStatus = 'fully_paid';
+      // Atomic update: guard on remainingBalance so two concurrent
+      // recordings can't both pass. Only one wins.
+      const updatedOrder = await Order.findOneAndUpdate(
+        { _id: order._id, remainingBalance: { $gte: amount } },
+        {
+          $inc: { cashCollected: amount, remainingBalance: -amount },
+          $set: {
+            manualPaymentMethod,
+            manualPaymentReference: manualPaymentReference || null,
+            manualPaymentVerificationStatus: manualPaymentMethod === 'cash' ? 'verified' : 'pending',
+            manualPaymentVerifiedBy: req.user._id,
+            manualPaymentVerifiedAt: new Date(),
+            updatedAt: Date.now()
+          }
+        },
+        { new: true }
+      );
+
+      if (!updatedOrder) {
+        return res.status(409).json({
+          error: 'Balance changed. Please refresh and try again.'
+        });
       }
 
-      // Store manual payment details
-      order.manualPaymentMethod = manualPaymentMethod;
-      order.manualPaymentReference = manualPaymentReference || null;
+      // If fully paid, transition payment status
+      if (updatedOrder.remainingBalance === 0) {
+        await Order.updateOne(
+          { _id: updatedOrder._id, remainingBalance: 0, paymentStatus: { $ne: 'fully_paid' } },
+          { $set: { paymentStatus: 'fully_paid', updatedAt: Date.now() } }
+        );
+        updatedOrder.paymentStatus = 'fully_paid';
+      }
 
-      // ✅ Cash is verified instantly. Bank/M-Pesa goes to Admin queue.
-      order.manualPaymentVerificationStatus = manualPaymentMethod === 'cash' ? 'verified' : 'pending';
-      order.manualPaymentVerifiedBy = req.user._id;
-      order.manualPaymentVerifiedAt = new Date();
-
-      await order.save();
+      // Reassign `order` so the downstream code (CashRecord, settlements,
+      // notifications) sees the updated document.
+      order = updatedOrder;
 
       // If cash was recorded, save a CashRecord
       if (manualPaymentMethod === 'cash') {
@@ -777,7 +955,11 @@ router.put(
       // ✅ Only trigger settlements if FULLY PAID, DELIVERED, and VERIFIED (cash only at this stage)
       if (order.paymentStatus === 'fully_paid' && order.deliveryStatus === 'delivered') {
         if (order.manualPaymentVerificationStatus === 'verified') {
-          await createSettlementsForOrder(order);
+          try {
+            await createSettlementsForOrder(order);
+          } catch (e) {
+            console.error('Settlement creation failed after record-cash:', e.message);
+          }
         }
       }
 
@@ -932,22 +1114,34 @@ router.put(
     try {
       const order = await Order.findById(req.params.id);
       if (!order) return res.status(404).json({ error: 'Order not found' });
-      
-      order.paymentStatus = 'fully_paid';
-      order.updatedAt = Date.now();
-      await order.save();
 
-      await logAction(req, 'mark_paid', order.customerId, { orderId: order._id });
+      // Atomic — prevents double-marking and keeps remainingBalance consistent.
+      const updated = await Order.findOneAndUpdate(
+        { _id: order._id, paymentStatus: { $ne: 'fully_paid' } },
+        {
+          $set: {
+            paymentStatus: 'fully_paid',
+            remainingBalance: 0,
+            balanceDue: 0,
+            updatedAt: Date.now()
+          }
+        },
+        { new: true }
+      );
 
-      // ✅ Process referral reward (if applicable)
-      try {
-        await processReferralReward(order);
-      } catch (err) {
-        console.error('❌ Referral reward failed for admin mark-paid:', err.message);
-        // Do NOT block the response – the order is already marked paid.
+      if (!updated) {
+        return res.status(400).json({ error: 'Order is already fully paid' });
       }
 
-      res.json({ success: true, order });
+      await logAction(req, 'mark_paid', updated.customerId, { orderId: updated._id });
+
+      try {
+        await processReferralReward(updated);
+      } catch (err) {
+        console.error('❌ Referral reward failed for admin mark-paid:', err.message);
+      }
+
+      res.json({ success: true, order: updated });
     } catch (err) {
       res.status(500).json({ error: err.message });
     }

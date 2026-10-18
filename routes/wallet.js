@@ -8,13 +8,15 @@ const User = require('../models/User');
 const WalletTransaction = require('../models/WalletTransaction');
 const WalletPIN = require('../models/WalletPIN');
 const TopUpRequest = require('../models/TopUpRequest');
+const Otp = require('../models/Otp');
+const Order = require('../models/Order');
 
 // Services & Helpers
 const WalletService = require('../services/walletService');
 const { createNotification } = require('../utils/notifications');
-const { sendEmail } = require('../utils/email');
+const { sendEmail, sendOrderConfirmationEmail } = require('../utils/email');
+const { processReferralReward } = require('../utils/referral');
 const { logAction } = require('../utils/audit');
-
 // Middleware
 const { protect } = require('../middleware/auth');
 const { allowRoles } = require('../middleware/roleCheck');
@@ -25,8 +27,8 @@ const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
 
 const router = express.Router();
 
-// ========== In‑memory OTP store ==========
-const otpStore = new Map();
+// ========== PIN OTPs are persisted in the Otp collection ==========
+// (Survives Render restarts; auto-cleaned by TTL index on expiresAt.)
 
 // ========== Helper: M‑Pesa initiation (uses global function from server.js) ==========
 async function initiateMpesaPayment(phoneNumber, amount, accountRef) {
@@ -227,16 +229,96 @@ router.post('/pay', protect, requireKYC, verifyTempToken, [
     const { amount, orderId } = req.body;
     const userId = req.user._id;
 
+    const order = await Order.findById(orderId);
+    if (!order) return res.status(404).json({ error: 'Order not found' });
+    if (order.customerId.toString() !== userId.toString()) {
+      return res.status(403).json({ error: 'Order does not belong to you' });
+    }
+
+    const currentStatus = order.paymentStatus;
+    if (!['pending', 'deposit_paid'].includes(currentStatus)) {
+      return res.status(400).json({ error: `Order cannot accept payment (status: ${currentStatus})` });
+    }
+
+    const isDepositOrder = ['wallet_deposit'].includes(order.paymentMethod);
+    let expectedAmount;
+    let newStatus, newDepositPaid, newRemaining;
+
+    if (currentStatus === 'pending' && isDepositOrder) {
+      const pct = order.depositPercentage || 0;
+      if (pct <= 0 || pct > 100) {
+        return res.status(400).json({ error: 'Order has invalid deposit configuration' });
+      }
+      expectedAmount = Math.round(order.totalKES * (pct / 100));
+      newDepositPaid = expectedAmount;
+      newRemaining = order.totalKES - expectedAmount;
+      newStatus = 'deposit_paid';
+    } else {
+      expectedAmount = order.remainingBalance > 0 ? order.remainingBalance : order.totalKES;
+      newDepositPaid = order.totalKES;
+      newRemaining = 0;
+      newStatus = 'fully_paid';
+    }
+
+    if (Math.abs(Number(amount) - expectedAmount) > 1) {
+      return res.status(400).json({
+        error: `Amount does not match. Expected KES ${expectedAmount}, got KES ${amount}.`
+      });
+    }
+
+    // Debit wallet first
     const result = await WalletService.debit(
       userId,
-      amount,
-      `Payment for order #${orderId}`,
-      orderId,
+      expectedAmount,
+      `Payment for order #${order.orderId}`,
+      order._id.toString(),
       'order'
     );
 
-    res.json({ success: true, newBalance: result.newBalance, transaction: result.transaction });
+    // Atomically mark the order as paid. If the order changed state
+    // between our read and this write, refund and abort.
+    const claimed = await Order.findOneAndUpdate(
+      { _id: order._id, paymentStatus: currentStatus },
+      {
+        $set: {
+          paymentStatus: newStatus,
+          depositPaid: newDepositPaid,
+          balanceDue: newRemaining,
+          remainingBalance: newRemaining,
+          updatedAt: Date.now()
+        }
+      },
+      { new: true }
+    );
+
+    if (!claimed) {
+      // Order was modified by another request; give the money back.
+      await WalletService.credit(
+        userId,
+        expectedAmount,
+        `Refund: order #${order.orderId} was already processed`,
+        order._id.toString(),
+        'refund'
+      );
+      return res.status(409).json({ error: 'Order was already processed. Wallet refunded.' });
+    }
+
+    // Post-payment side effects (best effort — do not fail the request if these throw)
+    try { await sendOrderConfirmationEmail(claimed); } catch (e) {
+      console.error('Order confirmation email failed:', e.message);
+    }
+    try { await processReferralReward(claimed); } catch (e) {
+      console.error('Referral reward failed:', e.message);
+    }
+
+    res.json({
+      success: true,
+      newBalance: result.newBalance,
+      transaction: result.transaction,
+      orderStatus: claimed.paymentStatus
+    });
   } catch (err) {
+    console.error('Wallet pay error:', err);
     res.status(400).json({ error: err.message });
   }
 });
@@ -297,12 +379,14 @@ router.post('/transfer', protect, requireKYC, verifyTempToken, [
 // Request OTP
 router.post('/pin/request-otp', protect, async (req, res) => {
   try {
-    const userId = req.user._id;
     const email = req.user.email;
+    const otpEmail = `${email}#pin`; // separate key from registration/password-reset OTPs
 
     const otp = Math.floor(100000 + Math.random() * 900000).toString();
-    const expiresAt = Date.now() + 5 * 60 * 1000;
-    otpStore.set(userId.toString(), { otp, expiresAt });
+    const expiresAt = new Date(Date.now() + 5 * 60 * 1000);
+
+    await Otp.deleteMany({ email: otpEmail });
+    await Otp.create({ email: otpEmail, otp, expiresAt });
 
     await sendEmail({
       to: email,
@@ -353,39 +437,54 @@ router.post('/pin/verify-otp', protect, [
 });
 
 // Verify PIN (returns temporary token)
-router.post('/pin/verify', protect, [
-  body('pin').isLength({ min: 4, max: 6 }).withMessage('PIN must be 4‑6 digits')
+router.post('/pin/verify-otp', protect, [
+  body('otp').isLength({ min: 6, max: 6 }).withMessage('OTP must be 6 digits'),
+  body('newPin').isLength({ min: 4, max: 6 }).withMessage('PIN must be 4‑6 digits')
 ], async (req, res) => {
   const errors = validationResult(req);
   if (!errors.isEmpty()) return res.status(400).json({ errors: errors.array() });
 
   try {
-    const { pin } = req.body;
     const userId = req.user._id;
-    const pinRecord = await WalletPIN.findOne({ userId });
-    if (!pinRecord) return res.status(404).json({ error: 'PIN not set' });
-    if (pinRecord.lockedUntil && pinRecord.lockedUntil > new Date()) {
-      return res.status(403).json({ error: 'PIN locked. Try again later.' });
-    }
-    const isValid = await pinRecord.comparePIN(pin);
-    if (!isValid) {
-      pinRecord.failedAttempts += 1;
-      if (pinRecord.failedAttempts >= 5) {
-        pinRecord.lockedUntil = new Date(Date.now() + 15 * 60 * 1000);
-      }
-      await pinRecord.save();
-      return res.status(401).json({ error: 'Invalid PIN' });
-    }
-    pinRecord.failedAttempts = 0;
-    pinRecord.lockedUntil = null;
-    await pinRecord.save();
+    const email = req.user.email;
+    const otpEmail = `${email}#pin`;
+    const { otp, newPin } = req.body;
 
-    const tempToken = jwt.sign(
-      { userId: userId.toString(), purpose: 'wallet-operation' },
-      process.env.JWT_SECRET,
-      { expiresIn: '1m' }
+    const otpDoc = await Otp.findOne({ email: otpEmail, otp });
+    if (!otpDoc) {
+      return res.status(400).json({ error: 'Invalid or expired OTP. Please request a new code.' });
+    }
+    if (otpDoc.expiresAt < new Date()) {
+      await Otp.deleteOne({ _id: otpDoc._id });
+      return res.status(400).json({ error: 'OTP expired. Please request a new code.' });
+    }
+
+    const pinHash = await bcrypt.hash(newPin, 10);
+    await WalletPIN.findOneAndUpdate(
+      { userId },
+      { userId, pinHash, failedAttempts: 0, lockedUntil: null },
+      { upsert: true, new: true }
     );
-    res.json({ success: true, tempToken });
+    await Otp.deleteOne({ _id: otpDoc._id });
+
+    res.json({ success: true, message: 'PIN set successfully.' });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ========== Check top‑up status ==========
+router.get('/topup/status/:merchantRequestId', protect, async (req, res) => {
+  try {
+    const topUp = await TopUpRequest.findOne({
+      merchantRequestId: req.params.merchantRequestId,
+      userId: req.user._id
+    });
+    if (!topUp) {
+      return res.status(404).json({ error: 'Top‑up request not found' });
+    }
+    res.json({ status: topUp.status }); // 'pending', 'completed', 'failed'
   } catch (err) {
     res.status(500).json({ error: err.message });
   }

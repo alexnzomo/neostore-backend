@@ -3,6 +3,7 @@ const mongoose = require('mongoose');
 const withdrawalSchema = new mongoose.Schema({
   userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
   amount: { type: Number, required: true, min: 0 },
+  fee: { type: Number, default: 0, min: 0 }, 
   method: { type: String, enum: ['bank', 'mpesa'], required: true },
   bankDetails: {
     bankName: String,

@@ -129,7 +129,7 @@ app.set('trust proxy', 1);
 // ---------- Rate limiting ----------
 const globalLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
-  max: 200,
+  limit: 200,
   skip: (req) => req.path.startsWith('/api/notifications') || req.path === '/api/health',
 });
 app.use('/api/', globalLimiter);
@@ -137,7 +137,7 @@ app.use('/api/', globalLimiter);
 // Stricter limits for auth endpoints
 const authLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
-  max: 10,
+  limit: 10,
   skipSuccessfulRequests: true,
 });
 app.use('/api/auth/login', authLimiter);
@@ -145,7 +145,7 @@ app.use('/api/auth/register', authLimiter);
 
 const resetLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
-  max: 5,
+  limit: 5,
   skipSuccessfulRequests: true,
 });
 app.use('/api/send-reset-code', resetLimiter);
@@ -219,38 +219,62 @@ app.post(
           // ✅ ORDER PAYMENT
           const orderId = metadata.orderId;
           if (orderId) {
-            const updatedOrder = await Order.findByIdAndUpdate(
-              orderId,
+            const existingOrder = await Order.findById(orderId);
+            if (!existingOrder) {
+              console.warn(`⚠️ Stripe webhook: order ${orderId} not found.`);
+              break;
+            }
+
+            const isDeposit = ['card_deposit', 'mpesa_deposit', 'wallet_deposit'].includes(existingOrder.paymentMethod);
+            const expectedDeposit = isDeposit
+              ? Math.round(existingOrder.totalKES * ((existingOrder.depositPercentage || 0) / 100))
+              : existingOrder.totalKES;
+
+            const claimedOrder = await Order.findOneAndUpdate(
+              { _id: orderId, paymentStatus: 'pending' },
               {
-                paymentStatus: 'fully_paid',
-                stripePaymentIntentId: paymentIntent.id,
+                $set: {
+                  paymentStatus: isDeposit ? 'deposit_paid' : 'fully_paid',
+                  stripePaymentIntentId: paymentIntent.id,
+                  depositPaid: isDeposit ? expectedDeposit : existingOrder.totalKES,
+                  balanceDue: isDeposit ? existingOrder.totalKES - expectedDeposit : 0,
+                  remainingBalance: isDeposit ? existingOrder.totalKES - expectedDeposit : 0,
+                  updatedAt: Date.now()
+                }
               },
               { new: true }
             );
-            console.log(`✅ Order ${orderId} marked as fully paid.`);
 
-            // ✅ Process referral reward
+            if (!claimedOrder) {
+              console.log(`⚠️ Stripe webhook: order ${orderId} already processed. Ignoring duplicate.`);
+              break;
+            }
+
+            console.log(`✅ Order ${orderId} marked as ${claimedOrder.paymentStatus}.`);
+
             try {
-              await processReferralReward(updatedOrder);
+              await processReferralReward(claimedOrder);
             } catch (err) {
               console.error('❌ Referral reward failed:', err.message);
             }
 
-            // ✅ Send confirmation email
             try {
-              await sendOrderConfirmationEmail(updatedOrder);
+              await sendOrderConfirmationEmail(claimedOrder);
             } catch (err) {
               console.error('❌ Stripe confirmation email failed:', err.message);
             }
           }
-        } // ✅ <-- THIS CLOSING BRACE WAS MISSING!
+        }
         break;
       }
       case 'payment_intent.payment_failed': {
         const failedIntent = event.data.object;
         const orderId = failedIntent.metadata.orderId;
         if (orderId) {
-          await Order.findByIdAndUpdate(orderId, { paymentStatus: 'payment_failed' });
+          await Order.findOneAndUpdate(
+            { _id: orderId, paymentStatus: 'pending' },
+            { $set: { paymentStatus: 'payment_failed', updatedAt: Date.now() } }
+          );
           console.log(`❌ Order ${orderId} payment failed.`);
         }
         break;
@@ -275,7 +299,6 @@ app.use((req, res, next) => {
 const csrfExcludedPaths = [
   '/api/auth/login',
   '/api/auth/register',
-  '/api/auth/logout',
   '/api/stripe/webhook',
   '/api/mpesa/callback',
   '/api/send-verification',
@@ -286,18 +309,47 @@ const csrfExcludedPaths = [
   '/api/verify-reset-code',
 ];
 app.use((req, res, next) => {
-  if (csrfExcludedPaths.includes(req.path)) {
+  const normalizedPath = req.path.replace(/\/+$/, '') || '/';
+  if (csrfExcludedPaths.includes(normalizedPath)) {
     return next();
   }
   verifyCsrfToken(req, res, next);
 });
 
 // ---------- MongoDB connection ----------
+// ========== Seed counters from existing data (one-time, idempotent) ==========
+async function seedCounters() {
+  const Counter = require('./models/Counter');
+
+  const existingUserCounter = await Counter.findById('userId');
+  if (!existingUserCounter) {
+    const lastUser = await User.findOne({ userId: { $regex: /^USR\d+$/ } }).sort({ userId: -1 });
+    let startSeq = 1000;
+    if (lastUser && lastUser.userId) {
+      const m = lastUser.userId.match(/\d+/);
+      if (m) startSeq = parseInt(m[0], 10);
+    }
+    await Counter.create({ _id: 'userId', seq: startSeq });
+    console.log(`✅ userId counter seeded at ${startSeq}`);
+  }
+
+  const existingProductCounter = await Counter.findById('productId');
+  if (!existingProductCounter) {
+    const lastProduct = await Product.findOne({ productId: { $regex: /^PRD\d+$/ } }).sort({ productId: -1 });
+    let startSeq = 1000;
+    if (lastProduct && lastProduct.productId) {
+      const m = lastProduct.productId.match(/\d+/);
+      if (m) startSeq = parseInt(m[0], 10);
+    }
+    await Counter.create({ _id: 'productId', seq: startSeq });
+    console.log(`✅ productId counter seeded at ${startSeq}`);
+  }
+}
+
 mongoose
   .connect(process.env.MONGO_URI)
   .then(async () => {
     console.log('✅ MongoDB connected');
-    // ========== Create indexes ==========
     await Promise.all([
       Order.createIndexes(),
       User.createIndexes(),
@@ -307,6 +359,7 @@ mongoose
       PickupStation.createIndexes(),
     ]);
     console.log('✅ Database indexes created');
+    await seedCounters();
   })
   .catch((err) => console.error('❌ MongoDB connection error:', err));
 
@@ -367,10 +420,15 @@ const PASSKEY = process.env.PASSKEY || 'bfb279f9aa9bdbcf158e97dd71a467cd2e0c8930
 const SHORTCODE = process.env.SHORTCODE || '174379';
 const CALLBACK_URL = process.env.CALLBACK_URL || 'https://your-ngrok-url.ngrok.io/callback';
 
+const MPESA_BASE_URL = process.env.MPESA_BASE_URL
+  || (process.env.NODE_ENV === 'production'
+    ? 'https://api.safaricom.co.ke'
+    : 'https://sandbox.safaricom.co.ke');
+
 async function getAccessToken() {
   const auth = Buffer.from(`${CONSUMER_KEY}:${CONSUMER_SECRET}`).toString('base64');
   const response = await axios.get(
-    'https://sandbox.safaricom.co.ke/oauth/v1/generate?grant_type=client_credentials',
+    `${MPESA_BASE_URL}/oauth/v1/generate?grant_type=client_credentials`,
     { headers: { Authorization: `Basic ${auth}` } }
   );
   return response.data.access_token;
@@ -387,7 +445,7 @@ async function initiateMpesaPayment(phoneNumber, amount, accountRef) {
   const token = await getAccessToken();
 
   const response = await axios.post(
-    'https://sandbox.safaricom.co.ke/mpesa/stkpush/v1/processrequest',
+    `${MPESA_BASE_URL}/mpesa/stkpush/v1/processrequest`,
     {
       BusinessShortCode: SHORTCODE,
       Password: password,
@@ -411,21 +469,82 @@ global.initiateMpesaPayment = initiateMpesaPayment;
 // ---------- M‑Pesa STK Push endpoint ----------
 app.post('/api/mpesa/stkpush', protect, async (req, res) => {
   const { phoneNumber, amount, orderId } = req.body;
-  if (!phoneNumber || !amount)
+  if (!phoneNumber || !amount) {
     return res.status(400).json({ error: 'Phone and amount required' });
+  }
 
   try {
-    const accountRef = `ORDER${orderId || Date.now()}`;
-    const response = await initiateMpesaPayment(phoneNumber, amount, accountRef);
-    if (response.ResponseCode === '0') {
-      if (orderId) {
-        await Order.findByIdAndUpdate(orderId, {
-          mpesaMerchantRequestId: response.MerchantRequestID,
-          mpesaCheckoutRequestId: response.CheckoutRequestID,
+    let verifiedAmount = Number(amount);
+    let verifiedOrderId = null;
+
+    if (orderId) {
+      const order = await Order.findById(orderId);
+      if (!order) return res.status(404).json({ error: 'Order not found' });
+
+      const uid = req.user._id.toString();
+      const isOwner = order.customerId.toString() === uid;
+      const isAssignedAgent = req.user.role === 'agent'
+        && order.assignedAgentId
+        && order.assignedAgentId.toString() === uid;
+      const isAdmin = ['admin', 'owner'].includes(req.user.role);
+
+      if (!isOwner && !isAssignedAgent && !isAdmin) {
+        return res.status(403).json({ error: 'Not authorized to send STK for this order' });
+      }
+
+      const currentStatus = order.paymentStatus;
+      if (!['pending', 'deposit_paid'].includes(currentStatus)) {
+        return res.status(400).json({ error: `Order cannot accept payment (status: ${currentStatus})` });
+      }
+
+      const isDepositOrder = order.paymentMethod === 'mpesa_deposit';
+      let expectedAmount;
+
+      if (currentStatus === 'pending' && isDepositOrder) {
+        const pct = order.depositPercentage || 0;
+        if (pct <= 0 || pct > 100) {
+          return res.status(400).json({ error: 'Order has invalid deposit configuration' });
+        }
+        expectedAmount = Math.round(order.totalKES * (pct / 100));
+      } else {
+        expectedAmount = order.remainingBalance > 0 ? order.remainingBalance : order.totalKES;
+      }
+
+      if (Math.abs(Number(amount) - expectedAmount) > 1) {
+        return res.status(400).json({
+          error: `Amount does not match. Expected KES ${expectedAmount}, got KES ${amount}.`
         });
       }
+
+      verifiedAmount = Math.round(expectedAmount);
+      verifiedOrderId = order._id;
     }
-    res.json({ success: true, data: response });
+
+    const accountRef = `ORDER${verifiedOrderId || Date.now()}`;
+    const response = await initiateMpesaPayment(phoneNumber, verifiedAmount, accountRef);
+
+    if (response.ResponseCode !== '0') {
+      console.error('STK push rejected by Safaricom:', response);
+      return res.status(400).json({
+        success: false,
+        error: response.ResponseDescription || 'Safaricom rejected the STK push',
+        details: response
+      });
+    }
+
+    if (verifiedOrderId) {
+      await Order.findByIdAndUpdate(verifiedOrderId, {
+        mpesaMerchantRequestId: response.MerchantRequestID,
+        mpesaCheckoutRequestId: response.CheckoutRequestID,
+        mpesaFailureReason: null
+      });
+    }
+
+    res.json({
+      success: true,
+      merchantRequestId: response.MerchantRequestID,
+      data: response
+    });
   } catch (error) {
     console.error(error.response?.data || error.message);
     res.status(500).json({ error: 'Payment initiation failed', details: error.response?.data });
@@ -456,12 +575,9 @@ app.post('/api/mpesa/callback', async (req, res) => {
         console.log(`⚠️ Duplicate M-Pesa callback for TXN: ${transactionId}. Ignoring.`);
         return res.json({ ResultCode: 0, ResultDesc: 'Duplicate ignored' });
       }
-      // Check if it exists in top-ups
-      const existingTopUp = await TopUpRequest.findOne({ 'metadata.transactionId': transactionId });
-      if (existingTopUp) {
-        console.log(`⚠️ Duplicate M-Pesa top-up callback for TXN: ${transactionId}. Ignoring.`);
-        return res.json({ ResultCode: 0, ResultDesc: 'Duplicate ignored' });
-      }
+      // Top-ups are deduplicated via the `status` field on TopUpRequest.
+      // Once a request is 'completed', a duplicate callback finds no pending
+      // record and exits safely. (No metadata field exists, so we don't query one.)
     }
     // ===== END IDEMPOTENCY CHECK =====
 
@@ -492,7 +608,7 @@ app.post('/api/mpesa/callback', async (req, res) => {
         } catch (err) {
           console.error(`❌ M-Pesa wallet top-up FAILED for user ${topUp.userId}:`, err.message);
           console.error(err.stack);
-          // Leave status as 'pending' so admin can manually investigate.
+          topUp.status = 'failed';
         }
       } else {
         console.log(`❌ M-Pesa wallet top-up failed. ResultCode: ${resultCode}`);
@@ -502,25 +618,23 @@ app.post('/api/mpesa/callback', async (req, res) => {
       return res.json({ ResultCode: 0, ResultDesc: 'Success' });
     }
 
-    // ===== STEP 2: Check if it's a sponsorship =====
-    if (accountRef && accountRef.startsWith('SPONSOR')) {
-      const SponsorshipRequest = require('./models/SponsorshipRequest');
-      const pendingRequest = await SponsorshipRequest.findOne({ merchantRequestId, status: 'pending' });
-      if (pendingRequest) {
-        if (resultCode === 0) {
-          const product = await Product.findById(pendingRequest.productId);
-          if (product) {
-            product.sponsored = true;
-            product.sponsoredUntil = new Date(Date.now() + pendingRequest.days * 24 * 60 * 60 * 1000);
-            await product.save();
-            console.log(`⭐ Product ${product.name} (${product._id}) sponsored for ${pendingRequest.days} days via M‑Pesa.`);
-          }
-          pendingRequest.status = 'completed';
-        } else {
-          pendingRequest.status = 'failed';
+    // ===== STEP 2: Sponsorship callback (lookup by MerchantRequestID) =====
+    const SponsorshipRequest = require('./models/SponsorshipRequest');
+    const pendingSponsor = await SponsorshipRequest.findOne({ merchantRequestId, status: 'pending' });
+    if (pendingSponsor) {
+      if (resultCode === 0) {
+        const product = await Product.findById(pendingSponsor.productId);
+        if (product) {
+          product.sponsored = true;
+          product.sponsoredUntil = new Date(Date.now() + pendingSponsor.days * 24 * 60 * 60 * 1000);
+          await product.save();
+          console.log(`⭐ Product ${product.name} (${product._id}) sponsored for ${pendingSponsor.days} days via M‑Pesa.`);
         }
-        await pendingRequest.save();
+        pendingSponsor.status = 'completed';
+      } else {
+        pendingSponsor.status = 'failed';
       }
+      await pendingSponsor.save();
       return res.json({ ResultCode: 0, ResultDesc: 'Success' });
     }
 
@@ -533,32 +647,60 @@ app.post('/api/mpesa/callback', async (req, res) => {
     }
 
     if (resultCode === 0) {
-      order.paymentStatus = 'fully_paid';
-      order.mpesaTransactionId = transactionId;
-      order.mpesaAmount = amount;
-      await order.save();
+      const isDeposit = order.paymentMethod === 'mpesa_deposit';
+      const expectedDeposit = isDeposit
+        ? Math.round(order.totalKES * ((order.depositPercentage || 0) / 100))
+        : order.totalKES;
+
+      const claimed = await Order.findOneAndUpdate(
+        { _id: order._id, paymentStatus: 'pending' },
+        {
+          $set: {
+            paymentStatus: isDeposit ? 'deposit_paid' : 'fully_paid',
+            mpesaTransactionId: transactionId,
+            mpesaAmount: amount,
+            depositPaid: isDeposit ? expectedDeposit : order.totalKES,
+            balanceDue: isDeposit ? order.totalKES - expectedDeposit : 0,
+            remainingBalance: isDeposit ? order.totalKES - expectedDeposit : 0,
+            updatedAt: Date.now()
+          }
+        },
+        { new: true }
+      );
+
+      if (!claimed) {
+        console.log(`⚠️ Order ${order.orderId} already processed (status: ${order.paymentStatus}). Ignoring duplicate callback.`);
+        return res.json({ ResultCode: 0, ResultDesc: 'Duplicate ignored' });
+      }
+
       console.log(`Order ${order.orderId} payment confirmed via M-Pesa. Transaction ID: ${transactionId}`);
 
-      // ✅ Send order confirmation email
       try {
-        await sendOrderConfirmationEmail(order);
+        await sendOrderConfirmationEmail(claimed);
       } catch (err) {
         console.error('❌ M-Pesa confirmation email failed:', err.message);
       }
 
-      // ✅ Process referral reward (AFTER order is saved and confirmed paid)
       try {
-        await processReferralReward(order);
+        await processReferralReward(claimed);
       } catch (err) {
         console.error('❌ Referral reward failed for M-Pesa order:', err.message);
       }
 
     } else {
-      order.paymentStatus = 'payment_failed';
-      order.mpesaFailureReason = callbackData.ResultDesc;
-      await order.save();
+      await Order.findOneAndUpdate(
+        { _id: order._id, paymentStatus: 'pending' },
+        {
+          $set: {
+            paymentStatus: 'payment_failed',
+            mpesaFailureReason: callbackData.ResultDesc,
+            updatedAt: Date.now()
+          }
+        }
+      );
       console.log(`Order ${order.orderId} M-Pesa payment failed: ${callbackData.ResultDesc}`);
     }
+
     res.json({ ResultCode: 0, ResultDesc: 'Success' });
   } catch (error) {
     console.error('M-Pesa callback error:', error);
@@ -569,13 +711,54 @@ app.post('/api/mpesa/callback', async (req, res) => {
 // ---------- Stripe Payment Intent ----------
 app.post('/api/create-payment-intent', protect, async (req, res) => {
   const { amount, currency, paymentMethodId, orderId } = req.body;
-  if (!amount || !paymentMethodId)
+  if (!amount || !paymentMethodId) {
     return res.status(400).json({ error: 'Missing amount or payment method' });
-  if (amount <= 0) return res.status(400).json({ error: 'Amount must be greater than 0' });
+  }
+  if (Number(amount) <= 0) {
+    return res.status(400).json({ error: 'Amount must be greater than 0' });
+  }
 
-  let amountInCents = Math.round(amount * 100);
-  if (currency === 'kes' || currency === 'KES') {
-    if (amountInCents < 5000) return res.status(400).json({ error: 'Minimum payment amount is KES 50' });
+  let verifiedAmount = Number(amount);
+
+  if (orderId) {
+    const order = await Order.findById(orderId);
+    if (!order) return res.status(404).json({ error: 'Order not found' });
+    if (order.customerId.toString() !== req.user._id.toString()) {
+      return res.status(403).json({ error: 'Order does not belong to you' });
+    }
+
+    const currentStatus = order.paymentStatus;
+    if (!['pending', 'deposit_paid'].includes(currentStatus)) {
+      return res.status(400).json({ error: `Order cannot accept payment (status: ${currentStatus})` });
+    }
+
+    const isDepositOrder = ['card_deposit'].includes(order.paymentMethod);
+    let expectedAmount;
+
+    if (currentStatus === 'pending' && isDepositOrder) {
+      const pct = order.depositPercentage || 0;
+      if (pct <= 0 || pct > 100) {
+        return res.status(400).json({ error: 'Order has invalid deposit configuration' });
+      }
+      expectedAmount = Math.round(order.totalKES * (pct / 100));
+    } else {
+      expectedAmount = order.remainingBalance > 0 ? order.remainingBalance : order.totalKES;
+    }
+
+    if (Math.abs(Number(amount) - expectedAmount) > 1) {
+      return res.status(400).json({
+        error: `Amount does not match. Expected KES ${expectedAmount}, got KES ${amount}.`
+      });
+    }
+
+    verifiedAmount = Math.round(expectedAmount);
+  }
+
+  const amountInCents = Math.round(verifiedAmount * 100);
+  if (currency === 'kes' || currency === 'KES' || !currency) {
+    if (amountInCents < 5000) {
+      return res.status(400).json({ error: 'Minimum payment amount is KES 50' });
+    }
   }
 
   try {
@@ -699,9 +882,207 @@ cron.schedule('0 2 * * *', async () => {
   }
 });
 
+// ============================================================
+// STK-QUERY RECOVERY CRON
+// Recovers orders/top-ups when Safaricom's callback is lost.
+// Runs every 2 minutes; queries Safaricom for stuck payments
+// that have been pending longer than 3 minutes.
+// ============================================================
+
+async function queryStkStatus(checkoutRequestId) {
+  const baseUrl = process.env.MPESA_BASE_URL
+    || (process.env.NODE_ENV === 'production'
+      ? 'https://api.safaricom.co.ke'
+      : 'https://sandbox.safaricom.co.ke');
+  const timestamp = new Date().toISOString().replace(/[^0-9]/g, '').slice(0, 14);
+  const password = Buffer.from(SHORTCODE + PASSKEY + timestamp).toString('base64');
+  const token = await getAccessToken();
+  const response = await axios.post(
+    `${baseUrl}/mpesa/stkpushquery/v1/query`,
+    {
+      BusinessShortCode: SHORTCODE,
+      Password: password,
+      Timestamp: timestamp,
+      CheckoutRequestID: checkoutRequestId
+    },
+    { headers: { Authorization: `Bearer ${token}` } }
+  );
+  return response.data;
+}
+
+async function recoverOrderViaStkQuery(order) {
+  let result;
+  try {
+    result = await queryStkStatus(order.mpesaCheckoutRequestId);
+  } catch (e) {
+    console.error(`[STK recovery] query failed for ${order.orderId}: ${e.message}`);
+    return;
+  }
+
+  // Safaricom returns errorCode when transaction is still processing
+  if (result.errorCode) {
+    console.log(`[STK recovery] ${order.orderId} still processing (${result.errorCode}).`);
+    return;
+  }
+
+  const rc = String(result.ResultCode);
+
+  if (rc === '0') {
+    const isDeposit = order.paymentMethod === 'mpesa_deposit';
+    const expectedDeposit = isDeposit
+      ? Math.round(order.totalKES * ((order.depositPercentage || 0) / 100))
+      : order.totalKES;
+    const transactionId = result.MpesaReceiptNumber || result.CheckoutRequestID;
+
+    const claimed = await Order.findOneAndUpdate(
+      { _id: order._id, paymentStatus: 'pending' },
+      {
+        $set: {
+          paymentStatus: isDeposit ? 'deposit_paid' : 'fully_paid',
+          mpesaTransactionId: transactionId,
+          mpesaAmount: result.Amount || order.totalKES,
+          depositPaid: isDeposit ? expectedDeposit : order.totalKES,
+          balanceDue: isDeposit ? order.totalKES - expectedDeposit : 0,
+          remainingBalance: isDeposit ? order.totalKES - expectedDeposit : 0,
+          updatedAt: Date.now()
+        }
+      },
+      { new: true }
+    );
+
+    if (!claimed) {
+      console.log(`[STK recovery] ${order.orderId} already processed by callback.`);
+      return;
+    }
+
+    console.log(`[STK recovery] ${order.orderId} recovered as ${claimed.paymentStatus}.`);
+
+    try {
+      await sendOrderConfirmationEmail(claimed);
+    } catch (err) {
+      console.error('[STK recovery] confirmation email failed:', err.message);
+    }
+
+    try {
+      await processReferralReward(claimed);
+    } catch (err) {
+      console.error('[STK recovery] referral reward failed:', err.message);
+    }
+  } else if (['1032', '1037', '2001'].includes(rc)) {
+    await Order.findOneAndUpdate(
+      { _id: order._id, paymentStatus: 'pending' },
+      {
+        $set: {
+          paymentStatus: 'payment_failed',
+          mpesaFailureReason: result.ResultDesc || `Safaricom ResultCode ${rc}`,
+          updatedAt: Date.now()
+        }
+      }
+    );
+    console.log(`[STK recovery] ${order.orderId} marked failed (${rc}: ${result.ResultDesc}).`);
+  } else {
+    console.log(`[STK recovery] ${order.orderId} unknown ResultCode ${rc}. Leaving pending.`);
+  }
+}
+
+async function recoverTopUpViaStkQuery(topUp) {
+  let result;
+  try {
+    result = await queryStkStatus(topUp.checkoutRequestId);
+  } catch (e) {
+    console.error(`[STK recovery] query failed for topup ${topUp._id}: ${e.message}`);
+    return;
+  }
+
+  if (result.errorCode) return;
+
+  const rc = String(result.ResultCode);
+
+  if (rc === '0') {
+    const claimed = await TopUpRequest.findOneAndUpdate(
+      { _id: topUp._id, status: 'pending' },
+      { $set: { status: 'completed' } },
+      { new: true }
+    );
+    if (!claimed) return;
+
+    try {
+      await WalletService.credit(
+        claimed.userId,
+        claimed.amount,
+        `Wallet top-up via M-Pesa (${result.MpesaReceiptNumber || 'recovery'})`,
+        claimed._id.toString(),
+        'topup'
+      );
+      await createNotification(
+        claimed.userId,
+        'system',
+        'Wallet top-up successful',
+        `Your wallet has been credited with KES ${claimed.amount.toFixed(2)} via M-Pesa.`,
+        '/account.html'
+      );
+      console.log(`[STK recovery] Topup ${claimed._id} recovered.`);
+    } catch (err) {
+      console.error(`[STK recovery] wallet credit failed for topup ${claimed._id}:`, err.message);
+      await TopUpRequest.updateOne({ _id: claimed._id }, { $set: { status: 'failed' } });
+    }
+  } else if (['1032', '1037', '2001'].includes(rc)) {
+    await TopUpRequest.updateOne(
+      { _id: topUp._id, status: 'pending' },
+      { $set: { status: 'failed' } }
+    );
+    console.log(`[STK recovery] Topup ${topUp._id} marked failed (${rc}).`);
+  }
+}
+
+cron.schedule('*/2 * * * *', async () => {
+  try {
+    const cutoff = new Date(Date.now() - 3 * 60 * 1000);
+
+    const stuckOrders = await Order.find({
+      paymentMethod: { $in: ['mpesa', 'mpesa_deposit'] },
+      paymentStatus: 'pending',
+      mpesaCheckoutRequestId: { $ne: null },
+      createdAt: { $lt: cutoff }
+    }).limit(10);
+
+    for (const order of stuckOrders) {
+      await recoverOrderViaStkQuery(order);
+    }
+
+    const stuckTopUps = await TopUpRequest.find({
+      status: 'pending',
+      checkoutRequestId: { $ne: null },
+      createdAt: { $lt: cutoff }
+    }).limit(10);
+
+    for (const topUp of stuckTopUps) {
+      await recoverTopUpViaStkQuery(topUp);
+    }
+  } catch (e) {
+    console.error('[STK recovery] cron error:', e.message);
+  }
+});
+
+console.log('✅ STK recovery cron scheduled (every 2 minutes)');
+
 // ---------- Start server ----------
 const PORT = process.env.PORT || 5000;
-app.listen(PORT, async () => {
-  console.log(`🚀 Backend running on http://localhost:${PORT}`);
-  await createOwnerIfNotExists();
-});
+
+async function start() {
+  try {
+    // Wait for Mongo connection to be ready
+    await mongoose.connection.asPromise();
+    console.log('✅ Mongo connection ready');
+    await createOwnerIfNotExists();
+
+    app.listen(PORT, () => {
+      console.log(`🚀 Backend running on http://localhost:${PORT}`);
+    });
+  } catch (err) {
+    console.error('❌ Startup failed:', err);
+    process.exit(1);
+  }
+}
+
+start();

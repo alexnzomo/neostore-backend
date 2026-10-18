@@ -248,7 +248,7 @@ router.put(
         );
         withdrawal.status = 'completed';
         withdrawal.completedAt = new Date();
-
+        withdrawal.fee = fee;
         // Audit
         await logAction(req, 'withdrawal_complete', withdrawal.userId._id, {
           withdrawalId: withdrawal._id,
