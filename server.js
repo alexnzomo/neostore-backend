@@ -493,14 +493,21 @@ app.post('/api/mpesa/stkpush', protect, async (req, res) => {
       }
 
       const currentStatus = order.paymentStatus;
-      if (!['pending', 'deposit_paid'].includes(currentStatus)) {
+      if (['cancelled', 'delivered', 'refunded', 'fully_paid', 'cash_collected'].includes(currentStatus)) {
         return res.status(400).json({ error: `Order cannot accept payment (status: ${currentStatus})` });
+      }
+
+      if (currentStatus === 'payment_failed') {
+        await Order.updateOne(
+          { _id: orderId, paymentStatus: 'payment_failed' },
+          { $set: { paymentStatus: 'pending', mpesaFailureReason: null, updatedAt: Date.now() } }
+        );
       }
 
       const isDepositOrder = order.paymentMethod === 'mpesa_deposit';
       let expectedAmount;
 
-      if (currentStatus === 'pending' && isDepositOrder) {
+  if ((currentStatus === 'pending' || currentStatus === 'payment_failed') && isDepositOrder) {
         const pct = order.depositPercentage || 0;
         if (pct <= 0 || pct > 100) {
           return res.status(400).json({ error: 'Order has invalid deposit configuration' });
@@ -728,14 +735,21 @@ app.post('/api/create-payment-intent', protect, async (req, res) => {
     }
 
     const currentStatus = order.paymentStatus;
-    if (!['pending', 'deposit_paid'].includes(currentStatus)) {
+    if (['cancelled', 'delivered', 'refunded', 'fully_paid', 'cash_collected'].includes(currentStatus)) {
       return res.status(400).json({ error: `Order cannot accept payment (status: ${currentStatus})` });
+    }
+
+    if (currentStatus === 'payment_failed') {
+      await Order.updateOne(
+        { _id: orderId, paymentStatus: 'payment_failed' },
+        { $set: { paymentStatus: 'pending', updatedAt: Date.now() } }
+      );
     }
 
     const isDepositOrder = ['card_deposit'].includes(order.paymentMethod);
     let expectedAmount;
 
-    if (currentStatus === 'pending' && isDepositOrder) {
+if ((currentStatus === 'pending' || currentStatus === 'payment_failed') && isDepositOrder) {
       const pct = order.depositPercentage || 0;
       if (pct <= 0 || pct > 100) {
         return res.status(400).json({ error: 'Order has invalid deposit configuration' });
