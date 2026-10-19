@@ -1010,7 +1010,8 @@ async function recoverTopUpViaStkQuery(topUp) {
       await WalletService.credit(
         claimed.userId,
         claimed.amount,
-        `Wallet top-up via M-Pesa (${result.MpesaReceiptNumber || 'recovery'})`,
+        //`Wallet top-up via M-Pesa (${result.MpesaReceiptNumber || 'recovery'})`,
+        `Wallet top-up via M-Pesa (Recovered via STK Query)`,
         claimed._id.toString(),
         'topup'
       );

@@ -23,7 +23,7 @@ router.post(
   requireKYC,
   sanitizeBody(['amount', 'method', 'bankDetails.bankName', 'bankDetails.accountName', 'bankDetails.accountNumber', 'mpesaNumber']),
   [
-    body('amount').isFloat({ min: 1 }).withMessage('Amount must be positive'),
+    body('amount').isFloat({ min: 100 }).withMessage('Minimum withdrawal amount is KES 100'),
     body('method').isIn(['bank', 'mpesa']).withMessage('Invalid withdrawal method'),
     body('bankDetails').custom((value, { req }) => {
       if (req.body.method === 'bank' && (!value || !value.bankName || !value.accountNumber)) {
@@ -47,19 +47,13 @@ router.post(
     try {
       const { amount, method, bankDetails, mpesaNumber } = req.body;
 
-      // ✅ Check if withdrawals are frozen
+      // 1. Check if withdrawals are frozen
       const frozenSetting = await Settings.findOne({ key: 'withdrawals_frozen' });
       if (frozenSetting && frozenSetting.value === 'true') {
         return res.status(403).json({ error: 'Withdrawals are currently frozen. Please try again later.' });
       }
 
-      // Check balance
-      const balance = await WalletService.getBalance(req.user._id);
-      if (balance < amount) {
-        return res.status(400).json({ error: 'Insufficient wallet balance' });
-      }
-
-      // Validate method-specific details
+      // 2. Validate method-specific details BEFORE deducting money
       if (method === 'bank' && (!bankDetails || !bankDetails.bankName || !bankDetails.accountNumber)) {
         return res.status(400).json({ error: 'Bank details required' });
       }
@@ -67,9 +61,40 @@ router.post(
         return res.status(400).json({ error: 'M-Pesa number required' });
       }
 
+      // 3. Calculate fee
+      let flatFee = 30, percentageFee = 1, threshold = 10000;
+      try {
+        const flatSetting = await Settings.findOne({ key: 'withdrawalFeeFlat' });
+        if (flatSetting) flatFee = flatSetting.value;
+        const percSetting = await Settings.findOne({ key: 'withdrawalFeePercentage' });
+        if (percSetting) percentageFee = percSetting.value;
+        const threshSetting = await Settings.findOne({ key: 'withdrawalFeeThreshold' });
+        if (threshSetting) threshold = threshSetting.value;
+      } catch (e) {}
+
+      const fee = amount >= threshold ? Math.round((amount * percentageFee) / 100) : flatFee;
+      const totalDebit = amount + fee;
+
+      // 4. Check balance (must cover amount + fee)
+      const balance = await WalletService.getBalance(req.user._id);
+      if (balance < totalDebit) {
+        return res.status(400).json({ error: `Insufficient wallet balance (requires KES ${totalDebit} including fee).` });
+      }
+
+      // 5. FREEZE FUNDS: Deduct immediately so user can't spend it while admin processes
+      await WalletService.debit(
+        req.user._id,
+        totalDebit,
+        `Withdrawal hold via ${method}`,
+        null,
+        'withdrawal'
+      );
+
+      // 6. Create the request, saving the fee!
       const withdrawal = new Withdrawal({
         userId: req.user._id,
         amount,
+        fee: fee,
         method,
         bankDetails: method === 'bank' ? bankDetails : null,
         mpesaNumber: method === 'mpesa' ? mpesaNumber : null,
@@ -77,15 +102,13 @@ router.post(
       });
       await withdrawal.save();
 
-      // Audit log
       await logAction(req, 'withdrawal_request', req.user._id, { amount, method, withdrawalId: withdrawal._id });
 
-      // Notify user
       await createNotification(
         req.user._id,
         'system',
         'Withdrawal request submitted',
-        `Your withdrawal request of KES ${amount} has been submitted for review.`,
+        `Your withdrawal request of KES ${amount} has been submitted for review. A fee of KES ${fee} was applied.`,
         '/account.html'
       );
 
@@ -158,7 +181,6 @@ router.put(
         return res.status(404).json({ error: 'Withdrawal not found' });
       }
 
-      // Status transition logic
       if (status === 'approved') {
         if (withdrawal.status !== 'pending') {
           return res.status(400).json({ error: 'Only pending can be approved' });
@@ -167,10 +189,8 @@ router.put(
         withdrawal.reviewedBy = req.user._id;
         withdrawal.reviewedAt = new Date();
 
-        // Audit
         await logAction(req, 'withdrawal_approve', withdrawal.userId._id, { withdrawalId: withdrawal._id, amount: withdrawal.amount });
 
-        // Notify user
         await createNotification(
           withdrawal.userId._id,
           'system',
@@ -183,19 +203,28 @@ router.put(
         if (withdrawal.status !== 'pending') {
           return res.status(400).json({ error: 'Only pending can be rejected' });
         }
+        
+        // REFUND THE FROZEN FUNDS (Using the saved fee)
+        const refundAmount = withdrawal.amount + (withdrawal.fee || 30);
+        await WalletService.credit(
+          withdrawal.userId._id,
+          refundAmount,
+          `Refund: Withdrawal rejected`,
+          withdrawal._id,
+          'refund'
+        );
+
         withdrawal.status = 'rejected';
         withdrawal.reviewedBy = req.user._id;
         withdrawal.reviewedAt = new Date();
 
-        // Audit
         await logAction(req, 'withdrawal_reject', withdrawal.userId._id, { withdrawalId: withdrawal._id, reason: adminNote });
 
-        // Notify user
         await createNotification(
           withdrawal.userId._id,
           'system',
           'Withdrawal rejected',
-          `Your withdrawal request of KES ${withdrawal.amount} has been rejected. Reason: ${adminNote || 'No reason provided.'}`,
+          `Your withdrawal request of KES ${withdrawal.amount} has been rejected and the funds refunded. Reason: ${adminNote || 'No reason provided.'}`,
           '/account.html'
         );
 
@@ -204,67 +233,23 @@ router.put(
           return res.status(400).json({ error: 'Must be approved first' });
         }
 
-        // ✅ ===== TIERED FEE LOGIC (INSERTED HERE) =====
-        let flatFee = 30;        // default
-        let percentageFee = 1;   // default 1%
-        let threshold = 10000;   // default KES 10,000
-
-        try {
-          const flatSetting = await Settings.findOne({ key: 'withdrawalFeeFlat' });
-          if (flatSetting) flatFee = flatSetting.value;
-          
-          const percSetting = await Settings.findOne({ key: 'withdrawalFeePercentage' });
-          if (percSetting) percentageFee = percSetting.value;
-          
-          const threshSetting = await Settings.findOne({ key: 'withdrawalFeeThreshold' });
-          if (threshSetting) threshold = threshSetting.value;
-        } catch (e) {}
-
-        let fee;
-        if (withdrawal.amount >= threshold) {
-          // Percentage fee (rounded to whole KES)
-          fee = Math.round((withdrawal.amount * percentageFee) / 100);
-        } else {
-          // Flat fee
-          fee = flatFee;
-        }
-
-        const totalDebit = withdrawal.amount + fee;
-        // ===== END TIERED FEE LOGIC =====
-
-        // Check balance (against totalDebit, not just withdrawal.amount)
-        const balance = await WalletService.getBalance(withdrawal.userId._id);
-        if (balance < totalDebit) {
-          return res.status(400).json({ error: 'Insufficient balance (including fee)' });
-        }
-
-        // Deduct from wallet (totalDebit = amount + fee)
-        const result = await WalletService.debit(
-          withdrawal.userId._id,
-          totalDebit,
-          `Withdrawal via ${withdrawal.method} (fee: KES ${fee})`,
-          withdrawal._id,
-          'withdrawal'
-        );
+        // Funds were ALREADY frozen at request time. Just mark completed. No balance check needed.
         withdrawal.status = 'completed';
         withdrawal.completedAt = new Date();
-        withdrawal.fee = fee;
-        // Audit
+
         await logAction(req, 'withdrawal_complete', withdrawal.userId._id, {
           withdrawalId: withdrawal._id,
           amount: withdrawal.amount,
-          fee: fee,
-          totalDebit: totalDebit,
-          method: withdrawal.method,
-          newBalance: result.newBalance
+          fee: withdrawal.fee,
+          totalDebit: withdrawal.amount + withdrawal.fee,
+          method: withdrawal.method
         });
 
-        // Notify user
         await createNotification(
           withdrawal.userId._id,
           'system',
           'Withdrawal completed',
-          `Your withdrawal request of KES ${withdrawal.amount} has been completed. A fee of KES ${fee} was deducted. Funds have been sent to your ${withdrawal.method} account.`,
+          `Your withdrawal request of KES ${withdrawal.amount} has been completed. Funds have been sent to your ${withdrawal.method} account.`,
           '/account.html'
         );
       }
