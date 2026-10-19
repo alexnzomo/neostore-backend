@@ -236,15 +236,21 @@ router.post('/pay', protect, requireKYC, verifyTempToken, [
     }
 
     const currentStatus = order.paymentStatus;
-    if (!['pending', 'deposit_paid'].includes(currentStatus)) {
+
+    // Block only terminal states. Allow retries after a failed attempt.
+    if (['cancelled', 'delivered', 'refunded', 'fully_paid', 'cash_collected'].includes(currentStatus)) {
       return res.status(400).json({ error: `Order cannot accept payment (status: ${currentStatus})` });
     }
+
+    // No reset needed for wallet pay — the debit and claim happen
+    // synchronously in this request. The claim below uses `currentStatus`
+    // which still matches the DB state (either 'pending' or 'payment_failed').
 
     const isDepositOrder = ['wallet_deposit'].includes(order.paymentMethod);
     let expectedAmount;
     let newStatus, newDepositPaid, newRemaining;
 
-    if (currentStatus === 'pending' && isDepositOrder) {
+    if ((currentStatus === 'pending' || currentStatus === 'payment_failed') && isDepositOrder) {
       const pct = order.depositPercentage || 0;
       if (pct <= 0 || pct > 100) {
         return res.status(400).json({ error: 'Order has invalid deposit configuration' });
@@ -401,42 +407,7 @@ router.post('/pin/request-otp', protect, async (req, res) => {
   }
 });
 
-// Verify OTP and set PIN
-router.post('/pin/verify-otp', protect, [
-  body('otp').isLength({ min: 6, max: 6 }).withMessage('OTP must be 6 digits'),
-  body('newPin').isLength({ min: 4, max: 6 }).withMessage('PIN must be 4‑6 digits')
-], async (req, res) => {
-  const errors = validationResult(req);
-  if (!errors.isEmpty()) return res.status(400).json({ errors: errors.array() });
-
-  try {
-    const userId = req.user._id;
-    const { otp, newPin } = req.body;
-
-    const stored = otpStore.get(userId.toString());
-    if (!stored) return res.status(400).json({ error: 'No OTP request found. Please request a new code.' });
-    if (Date.now() > stored.expiresAt) {
-      otpStore.delete(userId.toString());
-      return res.status(400).json({ error: 'OTP expired. Please request a new code.' });
-    }
-    if (stored.otp !== otp) return res.status(400).json({ error: 'Invalid OTP.' });
-
-    const pinHash = await bcrypt.hash(newPin, 10);
-    await WalletPIN.findOneAndUpdate(
-      { userId },
-      { userId, pinHash, failedAttempts: 0, lockedUntil: null },
-      { upsert: true, new: true }
-    );
-    otpStore.delete(userId.toString());
-
-    res.json({ success: true, message: 'PIN set successfully.' });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// Verify PIN (returns temporary token)
+// ========== Set PIN (via email OTP) ==========
 router.post('/pin/verify-otp', protect, [
   body('otp').isLength({ min: 6, max: 6 }).withMessage('OTP must be 6 digits'),
   body('newPin').isLength({ min: 4, max: 6 }).withMessage('PIN must be 4‑6 digits')
@@ -470,6 +441,51 @@ router.post('/pin/verify-otp', protect, [
     res.json({ success: true, message: 'PIN set successfully.' });
   } catch (err) {
     console.error(err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ========== Verify PIN (returns short-lived tempToken for wallet operations) ==========
+router.post('/pin/verify', protect, [
+  body('pin').isLength({ min: 4, max: 6 }).withMessage('PIN must be 4-6 digits')
+], async (req, res) => {
+  const errors = validationResult(req);
+  if (!errors.isEmpty()) return res.status(400).json({ errors: errors.array() });
+
+  try {
+    const { pin } = req.body;
+    const userId = req.user._id;
+
+    const pinRecord = await WalletPIN.findOne({ userId });
+    if (!pinRecord) return res.status(404).json({ error: 'PIN not set. Please set a PIN first.' });
+
+    if (pinRecord.lockedUntil && pinRecord.lockedUntil > new Date()) {
+      return res.status(403).json({ error: 'PIN locked. Try again later.' });
+    }
+
+    const isValid = await pinRecord.comparePIN(pin);
+    if (!isValid) {
+      pinRecord.failedAttempts += 1;
+      if (pinRecord.failedAttempts >= 5) {
+        pinRecord.lockedUntil = new Date(Date.now() + 15 * 60 * 1000);
+      }
+      await pinRecord.save();
+      return res.status(400).json({ error: 'Invalid PIN' });
+    }
+
+    pinRecord.failedAttempts = 0;
+    pinRecord.lockedUntil = null;
+    await pinRecord.save();
+
+    const tempToken = jwt.sign(
+      { userId: userId.toString(), purpose: 'wallet-operation' },
+      process.env.JWT_SECRET,
+      { expiresIn: '1m' }
+    );
+
+    res.json({ success: true, tempToken });
+  } catch (err) {
+    console.error('PIN verify error:', err);
     res.status(500).json({ error: err.message });
   }
 });
