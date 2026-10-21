@@ -6,8 +6,9 @@ const walletPINSchema = new mongoose.Schema({
   pinHash: { type: String, required: true },
   failedAttempts: { type: Number, default: 0 },
   lockedUntil: { type: Date, default: null },
+  pinChangedAt: { type: Date, default: null },
+  pinChangeReason: { type: String, enum: ['setup', 'change', 'forgot_reset'], default: null },
   createdAt: { type: Date, default: Date.now },
-  updatedAt: { type: Date, default: Date.now }
 });
 
 walletPINSchema.methods.comparePIN = async function(candidatePIN) {

@@ -25,6 +25,7 @@ router.post(
   [
     body('amount').isFloat({ min: 100 }).withMessage('Minimum withdrawal amount is KES 100'),
     body('method').isIn(['bank', 'mpesa']).withMessage('Invalid withdrawal method'),
+    body('pin').isLength({ min: 4, max: 6 }).withMessage('Wallet PIN required (4-6 digits)'),
     body('bankDetails').custom((value, { req }) => {
       if (req.body.method === 'bank' && (!value || !value.bankName || !value.accountNumber)) {
         throw new Error('Bank details (bankName, accountNumber) required for bank withdrawals');
@@ -47,7 +48,39 @@ router.post(
     try {
       const { amount, method, bankDetails, mpesaNumber } = req.body;
 
-      // 1. Check if withdrawals are frozen
+      // ✅ VERIFY PIN FIRST
+      const pinRecord = await require('../models/WalletPIN').findOne({ userId: req.user._id });
+      if (!pinRecord) {
+        return res.status(400).json({ error: 'No wallet PIN set. Please set a PIN first.' });
+      }
+      if (pinRecord.lockedUntil && pinRecord.lockedUntil > new Date()) {
+        return res.status(403).json({ error: 'PIN locked due to too many failed attempts. Try again later.' });
+      }
+      const isPinValid = await pinRecord.comparePIN(req.body.pin);
+      if (!isPinValid) {
+        pinRecord.failedAttempts += 1;
+        if (pinRecord.failedAttempts >= 5) {
+          pinRecord.lockedUntil = new Date(Date.now() + 15 * 60 * 1000);
+        }
+        await pinRecord.save();
+        return res.status(400).json({ error: 'Invalid PIN.' });
+      }
+      pinRecord.failedAttempts = 0;
+      pinRecord.lockedUntil = null;
+      await pinRecord.save();
+
+      // ✅ Check cooldown
+      if (pinRecord.pinChangedAt) {
+        const cooldownHours = pinRecord.pinChangeReason === 'forgot_reset' ? 24 : 1;
+        const hoursSince = (Date.now() - pinRecord.pinChangedAt.getTime()) / (1000 * 60 * 60);
+        if (hoursSince < cooldownHours) {
+          return res.status(403).json({
+            error: `For security, withdrawals are disabled for ${Math.ceil(cooldownHours - hoursSince)} more hour(s) after a recent PIN change.`
+          });
+        }
+      }
+
+      // ✅ Check if withdrawals are frozen
       const frozenSetting = await Settings.findOne({ key: 'withdrawals_frozen' });
       if (frozenSetting && frozenSetting.value === 'true') {
         return res.status(403).json({ error: 'Withdrawals are currently frozen. Please try again later.' });
@@ -85,7 +118,7 @@ router.post(
       await WalletService.debit(
         req.user._id,
         totalDebit,
-        `Withdrawal hold via ${method}`,
+        `Withdrawal request via ${method}`,
         null,
         'withdrawal'
       );
@@ -137,6 +170,7 @@ router.get('/pending', protect, allowRoles('admin', 'owner'), async (req, res) =
   try {
     const withdrawals = await Withdrawal.find({ status: 'pending' })
       .populate('userId', 'fullName email')
+      .populate('reviewedBy', 'fullName')
       .sort({ createdAt: 1 });
     res.json(withdrawals);
   } catch (err) {
@@ -151,6 +185,7 @@ router.get('/', protect, allowRoles('admin', 'owner'), async (req, res) => {
     const filter = status ? { status } : {};
     const withdrawals = await Withdrawal.find(filter)
       .populate('userId', 'fullName email')
+      .populate('reviewedBy', 'fullName')
       .sort({ createdAt: -1 });
     res.json(withdrawals);
   } catch (err) {

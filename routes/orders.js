@@ -343,13 +343,46 @@ router.post(
 
       // ===== PER‑VENDOR SHIPPING =====
       const shippingSettings = await Settings.findOne({ key: 'shipping_rates' });
-      const rates = shippingSettings && typeof shippingSettings.value === 'object'
-        ? shippingSettings.value
-        : {
-            delivery_region_fees: { default: 600 },
-            pickup_region_fees: { default: 100 },
-            volume_surcharges: { small: 0, medium: 150, large: 350 }
-          };
+
+      const defaultRates = {
+        delivery_region_fees: {
+          'Zone 0': 150,
+          'Zone 1': 250,
+          'Zone 2': 400,
+          'Zone 3': 500,
+          'Zone 4': 600,
+          'Zone 5': 700,
+          'Zone 6': 900,
+          default: 600
+        },
+        pickup_region_fees: {
+          'Zone 0': 100,
+          'Zone 1': 100,
+          'Zone 2': 150,
+          'Zone 3': 200,
+          'Zone 4': 250,
+          'Zone 5': 300,
+          'Zone 6': 400,
+          default: 100
+        },
+        volume_surcharges: {
+          small: 0,
+          medium: 150,
+          large: 350
+        }
+      };
+
+      let rates;
+      if (shippingSettings && typeof shippingSettings.value === 'object' && shippingSettings.value !== null) {
+        // Merge exactly like GET /api/settings/shipping-rates does
+        const merged = { ...defaultRates, ...shippingSettings.value };
+        merged.delivery_region_fees = { ...defaultRates.delivery_region_fees, ...merged.delivery_region_fees };
+        merged.pickup_region_fees = { ...defaultRates.pickup_region_fees, ...merged.pickup_region_fees };
+        merged.volume_surcharges = { ...defaultRates.volume_surcharges, ...merged.volume_surcharges };
+        rates = merged;
+      } else {
+        rates = defaultRates;
+      }
 
       shippingFeeKES = 0;
       const zone = req.body.zone || 'default';

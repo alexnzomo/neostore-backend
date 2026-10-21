@@ -61,6 +61,22 @@ const verifyTempToken = async (req, res, next) => {
   }
 };
 
+// Check if wallet operations are in cooldown after a recent PIN change
+async function checkPinCooldown(userId) {
+  const pin = await WalletPIN.findOne({ userId });
+  if (!pin || !pin.pinChangedAt) return { ok: true };
+
+  const hoursSince = (Date.now() - pin.pinChangedAt.getTime()) / (1000 * 60 * 60);
+  const cooldownHours = pin.pinChangeReason === 'forgot_reset' ? 24 : 1;
+
+  if (hoursSince >= cooldownHours) return { ok: true };
+  return {
+    ok: false,
+    hoursLeft: Math.ceil(cooldownHours - hoursSince),
+    reason: pin.pinChangeReason
+  };
+}
+
 // ========== Balance ==========
 router.get('/balance', protect, async (req, res) => {
   try {
@@ -342,6 +358,13 @@ router.post('/transfer', protect, requireKYC, verifyTempToken, [
     const senderId = req.user._id;
     const sender = req.user;
 
+    const cooldown = await checkPinCooldown(senderId);
+    if (!cooldown.ok) {
+      return res.status(403).json({
+        error: `For security, transfers are disabled for ${cooldown.hoursLeft} more hour(s) after a recent PIN change.`
+      });
+    }
+
     const receiver = await User.findOne({ email: receiverEmail });
     if (!receiver) throw new Error('Receiver not found');
 
@@ -386,21 +409,28 @@ router.post('/transfer', protect, requireKYC, verifyTempToken, [
 router.post('/pin/request-otp', protect, async (req, res) => {
   try {
     const email = req.user.email;
-    const otpEmail = `${email}#pin`; // separate key from registration/password-reset OTPs
+    const otpEmail = `${email}#pin`;
+    const reason = ['setup', 'change', 'forgot_reset'].includes(req.body.reason) ? req.body.reason : 'setup';
 
     const otp = Math.floor(100000 + Math.random() * 900000).toString();
     const expiresAt = new Date(Date.now() + 5 * 60 * 1000);
 
     await Otp.deleteMany({ email: otpEmail });
-    await Otp.create({ email: otpEmail, otp, expiresAt });
+    await Otp.create({ email: otpEmail, otp, expiresAt, reason });
+
+    const subjectMap = {
+      setup: 'Wallet PIN Setup Verification',
+      change: 'Wallet PIN Change Verification',
+      forgot_reset: 'Wallet PIN Reset Verification'
+    };
 
     await sendEmail({
       to: email,
-      subject: 'Wallet PIN Verification Code',
-      html: `<p>Your verification code is: <strong>${otp}</strong></p><p>This code expires in 5 minutes.</p>`
+      subject: subjectMap[reason],
+      html: `<p>Your verification code is: <strong>${otp}</strong></p><p>This code expires in 5 minutes.</p>${reason === 'forgot_reset' ? '<p style="color:red;"><strong>Warning:</strong> Resetting a forgotten PIN will disable wallet withdrawals and transfers for 24 hours.</p>' : ''}`
     });
 
-    res.json({ success: true, message: 'OTP sent to your email.' });
+    res.json({ success: true, message: 'OTP sent to your email.', reason });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: err.message });
@@ -430,15 +460,58 @@ router.post('/pin/verify-otp', protect, [
       return res.status(400).json({ error: 'OTP expired. Please request a new code.' });
     }
 
+    const existingPin = await WalletPIN.findOne({ userId });
+    const isFirstPin = !existingPin;
+    const reason = otpDoc.reason || (isFirstPin ? 'setup' : 'change');
+
     const pinHash = await bcrypt.hash(newPin, 10);
+
+    const updateData = {
+      userId,
+      pinHash,
+      failedAttempts: 0,
+      lockedUntil: null
+    };
+
+    // Only set cooldown metadata if this is NOT a first-time setup
+    if (!isFirstPin) {
+      updateData.pinChangedAt = new Date();
+      updateData.pinChangeReason = reason;
+    }
+
     await WalletPIN.findOneAndUpdate(
       { userId },
-      { userId, pinHash, failedAttempts: 0, lockedUntil: null },
+      updateData,
       { upsert: true, new: true }
     );
     await Otp.deleteOne({ _id: otpDoc._id });
 
-    res.json({ success: true, message: 'PIN set successfully.' });
+    // Notification email
+    try {
+      const cooldownMsg = reason === 'forgot_reset'
+        ? '<p style="color:red;"><strong>Withdrawals and transfers are disabled for 24 hours.</strong></p>'
+        : '<p><strong>Withdrawals and transfers are disabled for 1 hour.</strong></p>';
+
+      const subject = isFirstPin
+        ? 'Wallet PIN Set'
+        : (reason === 'forgot_reset' ? 'Wallet PIN Reset' : 'Wallet PIN Changed');
+
+      await sendEmail({
+        to: email,
+        subject,
+        html: `<p>Your wallet PIN was ${isFirstPin ? 'set' : 'changed'} at ${new Date().toLocaleString()}.</p>
+               ${isFirstPin ? '' : cooldownMsg}
+               <p>If this wasn't you, reset your password immediately and contact support at support@mwechestore.com.</p>`
+      });
+    } catch (e) {
+      console.warn('PIN change notification email failed:', e.message);
+    }
+
+    res.json({
+      success: true,
+      message: isFirstPin ? 'PIN set successfully.' : 'PIN changed successfully.',
+      cooldownHours: isFirstPin ? 0 : (reason === 'forgot_reset' ? 24 : 1)
+    });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: err.message });
