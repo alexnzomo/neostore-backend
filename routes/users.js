@@ -66,6 +66,13 @@ router.put(
         return res.status(403).json({ error: 'Cannot demote the platform owner' });
       }
 
+      // Guard: no user can change their own role
+      if (user._id.toString() === req.user._id.toString() && role !== user.role) {
+        return res.status(403).json({
+          error: 'You cannot change your own role. Ask another owner to change it.'
+        });
+      }
+
       user.role = role;
       await user.save();
 
@@ -196,6 +203,13 @@ router.put(
       const user = await User.findById(req.params.id);
       if (!user) return res.status(404).json({ error: 'User not found' });
       if (user.role === 'owner') return res.status(403).json({ error: 'Cannot suspend the owner' });
+
+      // Guard: only owner can suspend another admin
+      if (user.role === 'admin' && req.user.role !== 'owner') {
+        return res.status(403).json({
+          error: 'Only the owner can suspend another admin.'
+        });
+      }
 
       user.isSuspended = isSuspended;
       if (suspendedUntil) user.suspendedUntil = new Date(suspendedUntil);

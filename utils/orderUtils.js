@@ -99,6 +99,27 @@ async function processRefund(order) {
         }
       } catch (err) {
         console.error(`Stripe refund failed for order ${order.orderId}:`, err.message);
+
+        // Notify admins/owners so they can process the refund manually in Stripe dashboard
+        try {
+          const User = require('../models/User');
+          const { createNotification } = require('./notifications');
+          const adminsAndOwners = await User.find({ role: { $in: ['admin', 'owner'] } });
+          const amountDisplay = Math.round(refundableAmount).toLocaleString();
+
+          for (const recipient of adminsAndOwners) {
+            await createNotification(
+              recipient._id,
+              'system',
+              '⚠️ Stripe Refund Failed',
+              `Order #${order.orderId} refund of KES ${amountDisplay} failed: ${err.message}. ` +
+              `Please issue a manual refund in the Stripe dashboard (PaymentIntent: ${order.stripePaymentIntentId}).`,
+              '/admin.html?tab=orders'
+            );
+          }
+        } catch (notifyErr) {
+          console.error('Admin notification for failed Stripe refund also failed:', notifyErr.message);
+        }
       }
     }
     return;

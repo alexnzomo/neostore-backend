@@ -112,7 +112,7 @@ router.post(
     }
 
     // 6. Issue JWT and set cookie
-    const token = jwt.sign({ id: newUser._id, role: newUser.role }, process.env.JWT_SECRET, { expiresIn: '7d' });
+    const token = jwt.sign({ id: newUser._id, role: newUser.role }, process.env.JWT_SECRET, { expiresIn: '1d' });
     res.cookie('token', token, {
       httpOnly: true,
       secure: process.env.NODE_ENV === 'production',
@@ -125,6 +125,7 @@ router.post(
     res.status(201).json({
       message: 'User registered successfully',
       user: {
+        _id: newUser._id,
         id: newUser._id,
         userId: newUser.userId,
         fullName,
@@ -169,7 +170,7 @@ router.post(
 
     await logAction(req, 'login_success', user._id, { email: user.email });
 
-    const token = jwt.sign({ id: user._id, role: user.role }, process.env.JWT_SECRET, { expiresIn: '7d' });
+    const token = jwt.sign({ id: user._id, role: user.role }, process.env.JWT_SECRET, { expiresIn: '1d' });
     res.cookie('token', token, {
       httpOnly: true,
       secure: process.env.NODE_ENV === 'production',
@@ -181,7 +182,7 @@ router.post(
 
     res.json({
       message: 'Login successful',
-      user: { id: user._id, userId: user.userId, fullName: user.fullName, email: user.email, role: user.role, referralCode: user.referralCode || null, phone: user.phone || null, emailVerified: user.emailVerified },
+      user: { _id: user._id, id: user._id, userId: user.userId, fullName: user.fullName, email: user.email, role: user.role, referralCode: user.referralCode || null, phone: user.phone || null, emailVerified: user.emailVerified },
       csrfToken,
     });
   }

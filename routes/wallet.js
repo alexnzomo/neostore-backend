@@ -181,6 +181,14 @@ router.post('/topup/initiate', protect, [
     const { amount, method, phoneNumber } = req.body;
     const userId = req.user._id;
 
+    // Stripe currency minimums — KES 50 is the effective minimum for Stripe.
+    // Validated here so the user sees a clear error instead of a raw Stripe rejection.
+    if (method === 'stripe' && amount < 50) {
+      return res.status(400).json({
+        error: 'Minimum Stripe top-up is KES 50. For smaller amounts, please use M-Pesa.'
+      });
+    }
+
     if (method === 'stripe') {
       const paymentIntent = await stripe.paymentIntents.create({
         amount: Math.round(amount * 100), // cents
@@ -244,6 +252,16 @@ router.post('/pay', protect, requireKYC, verifyTempToken, [
   try {
     const { amount, orderId } = req.body;
     const userId = req.user._id;
+
+    // Enforce PIN cooldown — mirrors /transfer and /withdrawals.
+    // Blocks wallet payments for 1h (PIN change) or 24h (forgot-reset) to give
+    // the legitimate user a window to detect account compromise.
+    const cooldown = await checkPinCooldown(userId);
+    if (!cooldown.ok) {
+      return res.status(403).json({
+        error: `For security, wallet payments are disabled for ${cooldown.hoursLeft} more hour(s) after a recent PIN change. Please pay with M-Pesa or card, or wait and retry.`
+      });
+    }
 
     const order = await Order.findById(orderId);
     if (!order) return res.status(404).json({ error: 'Order not found' });

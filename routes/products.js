@@ -10,6 +10,7 @@ const { sanitizeBody } = require('../middleware/sanitize');
 const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
 const WalletService = require('../services/walletService');
 const Review = require('../models/Review');
+const KYC = require('../models/KYC');
 
 const axios = require('axios');
 
@@ -18,7 +19,7 @@ const router = express.Router();
 // ========== Helper: Get sponsorship fee per day ==========
 async function getSponsorshipFeePerDay() {
   const setting = await Settings.findOne({ key: 'sponsorshipFeePerDay' });
-  return setting ? setting.value : 130; // default 130 KES ($1/day)
+  return setting ? setting.value : 150; // default 150 KES/day (canonical)
 }
 
 // ========== Helper: Initiate M‑Pesa STK push ==========
@@ -122,7 +123,9 @@ router.get('/', async (req, res) => {
 router.get('/:id', async (req, res) => {
   try {
     const product = await Product.findById(req.params.id);
-    if (!product) return res.status(404).json({ error: 'Product not found' });
+    if (!product || product.isDeleted) {
+      return res.status(404).json({ error: 'Product not found' });
+    }
     res.json(product);
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -144,7 +147,7 @@ router.post('/', protect, allowRoles('vendor', 'admin', 'owner'), [
     }),
   body('stock').isInt({ min: 0 }).withMessage('Stock must be a non‑negative integer'),
   body('shippingFee').isFloat({ min: 0 }).withMessage('Shipping fee must be positive'),
-  body('imageUrl').isURL().withMessage('Invalid image URL'),
+  body('imageUrl').isURL({ protocols: ['http', 'https'], require_protocol: true }).withMessage('Invalid image URL (http/https only)'),
   body('category').trim().notEmpty().withMessage('Category is required'),
   body('brand').optional().trim().isLength({ max: 100 }).withMessage('Brand too long'), 
   body('commissionOverride').optional().isFloat({ min: 0, max: 100 }).withMessage('Commission must be between 0 and 100'),
@@ -194,7 +197,7 @@ router.put('/:id', protect,
       }),
     body('stock').optional().isInt({ min: 0 }).withMessage('Stock must be non‑negative'),
     body('shippingFee').optional().isFloat({ min: 0 }).withMessage('Shipping fee must be positive'),
-    body('imageUrl').optional().isURL().withMessage('Invalid image URL'),
+    body('imageUrl').optional().isURL({ protocols: ['http', 'https'], require_protocol: true }).withMessage('Invalid image URL (http/https only)'),
     body('category').optional().trim().notEmpty(),
     body('brand').optional().trim().isLength({ max: 100 }).withMessage('Brand too long'),
     body('commissionOverride').optional().isFloat({ min: 0, max: 100 }).withMessage('Commission must be between 0 and 100'),
@@ -300,6 +303,16 @@ router.post('/:id/sponsor', protect, async (req, res) => {
 
     // 1. Wallet payment
     if (paymentMethod === 'wallet') {
+      // Enforce KYC for wallet debits — matches /api/wallet/pay, /api/wallet/transfer,
+      // and /api/withdrawals. Sponsorship shouldn't be a way to spend wallet funds
+      // while KYC is pending or rejected.
+      const kyc = await KYC.findOne({ userId: req.user._id });
+      if (!kyc || kyc.status !== 'verified') {
+        return res.status(403).json({
+          error: 'KYC verification is required for wallet payments. Please complete KYC in your account settings or use Stripe/M-Pesa instead.'
+        });
+      }
+
       const user = await User.findById(req.user._id);
       if (user.walletBalance < totalAmount) {
         return res.status(400).json({ error: 'Insufficient wallet balance' });

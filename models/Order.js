@@ -5,7 +5,8 @@ const orderItemSchema = new mongoose.Schema({
   productId: { type: mongoose.Schema.Types.ObjectId, ref: 'Product', required: true },
   name: { type: String, required: true },
   priceUSD: { type: Number, required: true, min: 0 },
-  quantity: { type: Number, required: true, min: 1 }
+  quantity: { type: Number, required: true, min: 1 },
+  vendorName: { type: String, default: null } // denormalized at order creation
 });
 
 const orderSchema = new mongoose.Schema({
@@ -44,8 +45,11 @@ const orderSchema = new mongoose.Schema({
     county: String,
     landmark: { type: String, default: null },
     stationId: { type: mongoose.Schema.Types.ObjectId, ref: 'PickupStation' },
-    stationName: String
+    stationName: String,
+    stationAddress: { type: String, default: null },
+    stationCity: { type: String, default: null }
   },
+  zone: { type: String, default: 'default' }, 
 
   location: {
     type: { type: String, enum: ['Point'], default: 'Point' },

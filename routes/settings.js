@@ -55,7 +55,7 @@ router.put('/deposit-percentage', protect, allowRoles('admin', 'owner'), async (
 // ========== Sponsorship Fee ==========
 router.get('/sponsorship-fee', async (req, res) => {
   let setting = await Settings.findOne({ key: 'sponsorshipFeePerDay' });
-  if (!setting) setting = { value: 500 };
+  if (!setting) setting = { value: 150 };
   res.json({ fee: setting.value });
 });
 
@@ -141,6 +141,18 @@ router.put('/withdrawals-frozen', protect, allowRoles('owner'), async (req, res)
 });
 
 // ========== Referral Settings (Owner Only) ==========
+
+// Get referral percentage (public — admin dashboard reads it)
+router.get('/referralPercentage', async (req, res) => {
+  const value = await getSetting('referralPercentage');
+  res.json({ value: value !== null ? value : 15 });
+});
+
+// Get minimum order amount for referral reward (public — admin dashboard reads it)
+router.get('/minReferralOrder', async (req, res) => {
+  const value = await getSetting('minReferralOrder');
+  res.json({ value: value !== null ? value : 3000 });
+});
 
 // Set referral percentage (0-100%)
 router.put(
@@ -321,15 +333,40 @@ router.get('/shipping-rates', async (req, res) => {
 // Update shipping rates (owner only)
 router.put('/shipping-rates', protect, allowRoles('owner'), async (req, res) => {
   const { delivery_region_fees, pickup_region_fees, volume_surcharges } = req.body;
+
   if (!delivery_region_fees || !pickup_region_fees || !volume_surcharges) {
     return res.status(400).json({ error: 'Missing required fields' });
   }
-  const rates = { delivery_region_fees, pickup_region_fees, volume_surcharges };
+
+  // Validate volume_surcharges shape — must have small, medium, large as non-negative numbers.
+  // Without this, a malformed save (e.g. missing 'medium') is silently merged with defaults
+  // on read, masking the admin's incomplete save.
+  const vs = volume_surcharges;
+  const requiredKeys = ['small', 'medium', 'large'];
+  for (const key of requiredKeys) {
+    if (typeof vs[key] !== 'number' || vs[key] < 0 || !Number.isFinite(vs[key])) {
+      return res.status(400).json({
+        error: `volume_surcharges.${key} must be a non-negative number. Got: ${JSON.stringify(vs[key])}`
+      });
+    }
+  }
+
+  // Validate delivery_region_fees and pickup_region_fees are objects
+  if (typeof delivery_region_fees !== 'object' || Array.isArray(delivery_region_fees)) {
+    return res.status(400).json({ error: 'delivery_region_fees must be an object' });
+  }
+  if (typeof pickup_region_fees !== 'object' || Array.isArray(pickup_region_fees)) {
+    return res.status(400).json({ error: 'pickup_region_fees must be an object' });
+  }
+
+  const rates = { delivery_region_fees, pickup_region_fees, volume_surcharges: vs };
+
   await Settings.findOneAndUpdate(
     { key: 'shipping_rates' },
     { key: 'shipping_rates', value: rates },
     { upsert: true, new: true }
   );
+
   res.json({ success: true, rates });
 });
 

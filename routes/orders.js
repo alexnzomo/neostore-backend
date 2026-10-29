@@ -44,6 +44,13 @@ async function createSettlementsForOrder(order) {
   }  
   const vendorMap = {};
   const categories = await Category.find();
+
+  // Read global commission setting — this is the fallback for products without
+  // a per-product override OR a matching category. Aligns settlement calculation
+  // with utils/commission.js (referral rewards) so both paths agree.
+  const globalCommissionSetting = await Settings.findOne({ key: 'global_commission' });
+  const globalCommission = globalCommissionSetting ? globalCommissionSetting.value : 5;
+
   for (const item of order.items) {
     const product = await Product.findById(item.productId);
     if (!product) continue;
@@ -58,7 +65,11 @@ async function createSettlementsForOrder(order) {
     }
     vendorMap[vendorId].items.push(item);
     vendorMap[vendorId].subtotalUSD += item.priceUSD * item.quantity;
-    const rate = product.commissionOverride !== null ? product.commissionOverride : (categories.find(c => c.name === product.category)?.commission || 5);
+    // Explicitly preserve 0% commission — `|| 5` would treat 0 as missing
+    const categoryCommission = categories.find(c => c.name === product.category)?.commission;
+    const rate = product.commissionOverride !== null
+      ? product.commissionOverride
+      : (categoryCommission !== undefined ? categoryCommission : globalCommission);
     const commissionAmount = item.priceUSD * item.quantity * (rate / 100);
     vendorMap[vendorId].totalCommissionUSD += commissionAmount;
   }
@@ -77,26 +88,41 @@ async function createSettlementsForOrder(order) {
     const platformCommissionKES = data.totalCommissionUSD * 130;
 
     // Idempotent upsert — safe against concurrent triggers.
-    const settlement = await Settlement.findOneAndUpdate(
-      { orderId: order._id, vendorId: data.vendorId },
-      {
-        $setOnInsert: {
-          orderId: order._id,
-          vendorId: data.vendorId,
-          agentId: order.assignedAgentId,
-          stationId: isPickup ? order.deliveryInfo.stationId : null,
-          vendorEarnings: vendorEarningsKES,
-          agentEarnings: agentEarnings,
-          stationEarnings: stationEarnings,
-          platformCommission: platformCommissionKES,
-          vendorPaid: false,
-          agentPaid: false,
-          stationPaid: false
-        }
-      },
-      { upsert: true, new: true, setDefaultsOnInsert: true }
-    );
-    settlements.push(settlement);
+    // MongoDB findOneAndUpdate with upsert can throw E11000 under concurrent calls;
+    // catch it and re-read the existing settlement (created by the winning caller).
+    let settlement;
+    try {
+      settlement = await Settlement.findOneAndUpdate(
+        { orderId: order._id, vendorId: data.vendorId },
+        {
+          $setOnInsert: {
+            orderId: order._id,
+            vendorId: data.vendorId,
+            agentId: order.assignedAgentId,
+            stationId: isPickup ? order.deliveryInfo.stationId : null,
+            vendorEarnings: vendorEarningsKES,
+            agentEarnings: agentEarnings,
+            stationEarnings: stationEarnings,
+            platformCommission: platformCommissionKES,
+            vendorPaid: false,
+            agentPaid: false,
+            stationPaid: false
+          }
+        },
+        { upsert: true, new: true, setDefaultsOnInsert: true }
+      );
+    } catch (upsertErr) {
+      if (upsertErr.code === 11000) {
+        // Concurrent upsert won the race — read the settlement it created
+        settlement = await Settlement.findOne({ orderId: order._id, vendorId: data.vendorId });
+      } else {
+        throw upsertErr;
+      }
+    }
+
+    if (settlement) {
+      settlements.push(settlement);
+    }
   }
   return settlements;
 }
@@ -104,7 +130,7 @@ async function createSettlementsForOrder(order) {
 // ========== Routes ==========
 
 // Get orders (role-scoped) – PAGINATED
-router.get('/', protect, allowRoles('admin', 'owner', 'station_manager', 'agent'), async (req, res) => {
+router.get('/', protect, allowRoles('admin', 'owner', 'station_manager', 'agent', 'vendor'), async (req, res) => {
   try {
     const limit = parseInt(req.query.limit) || 50;
     const skip = parseInt(req.query.skip) || 0;
@@ -113,17 +139,25 @@ router.get('/', protect, allowRoles('admin', 'owner', 'station_manager', 'agent'
 
     // ----  search filter ----
     if (req.query.search) {
-      const search = req.query.search.trim();
-      query.$or = [
-        { orderId: { $regex: search, $options: 'i' } },
-        { customerName: { $regex: search, $options: 'i' } },
-        { customerPhone: { $regex: search, $options: 'i' } },
-        { mpesaTransactionId: { $regex: search, $options: 'i' } },
-        { stripePaymentIntentId: { $regex: search, $options: 'i' } },
-        { manualPaymentReference: { $regex: search, $options: 'i' } }
-      ];
-    }
+      const rawSearch = req.query.search.trim();
+      // Escape regex metacharacters to prevent ReDoS (catastrophic backtracking)
+      // and regex syntax errors from user input.
+      const search = rawSearch.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+      if (search.length > 0) {
+        query.$or = [
+          { orderId: { $regex: search, $options: 'i' } },
+          { customerName: { $regex: search, $options: 'i' } },
+          { customerPhone: { $regex: search, $options: 'i' } },
+          { mpesaTransactionId: { $regex: search, $options: 'i' } },
+          { stripePaymentIntentId: { $regex: search, $options: 'i' } },
+          { manualPaymentReference: { $regex: search, $options: 'i' } }
+        ];
+      }
+    }\
     // ---- End search filter ----
+
+    let vendorProductIds = null; // set only for vendor role
 
     if (req.user.role === 'station_manager') {
       const user = await User.findById(req.user._id).select('stationId');
@@ -137,13 +171,45 @@ router.get('/', protect, allowRoles('admin', 'owner', 'station_manager', 'agent'
     } else if (req.user.role === 'agent') {
       // Agents only see orders assigned to them
       query.assignedAgentId = req.user._id;
-    }
     
+    } else if (req.user.role === 'vendor') {
+      // Vendors only see orders that contain at least one of their products
+      vendorProductIds = await Product.find({ vendorId: req.user._id }).distinct('_id');
+      query['items.productId'] = { $in: vendorProductIds };
+    }
+
     const [orders, total] = await Promise.all([
       Order.find(query).sort({ createdAt: -1 }).skip(skip).limit(limit),
       Order.countDocuments(query)
     ]);
-    
+
+    // Vendor projection: only their items and only the fields they need
+    if (req.user.role === 'vendor' && vendorProductIds) {
+      const myIdSet = new Set(vendorProductIds.map(id => id.toString()));
+      const projected = orders.map(order => {
+        const myItems = order.items.filter(it => myIdSet.has(it.productId.toString()));
+        const mySubtotalUSD = myItems.reduce((s, it) => s + it.priceUSD * it.quantity, 0);
+        const myVendorKES = Math.round(mySubtotalUSD * 130);
+        const paidEnough = ['fully_paid', 'cash_collected', 'deposit_paid'].includes(order.paymentStatus);
+
+        return {
+          _id: order._id,
+          orderId: order.orderId,
+          createdAt: order.createdAt,
+          items: myItems.map(it => ({
+            productId: it.productId,
+            name: it.name,
+            priceUSD: it.priceUSD,
+            quantity: it.quantity
+          })),
+          vendorSubtotalKES: myVendorKES,
+          paymentReadyToShip: paidEnough,
+          deliveryStatus: order.deliveryStatus
+        };
+      });
+      return res.json({ orders: projected, total, limit, skip });
+    }
+
     res.json({ orders, total, limit, skip });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -226,17 +292,45 @@ router.post(
         }
       }
 
-      // Resolve pickup station
-      if (deliveryInfo.type === 'pickup') {
-        if (!deliveryInfo.stationName) {
-          return res.status(400).json({ error: 'Pickup station is required for pickup orders' });
+      // Validate delivery info based on type
+      if (deliveryInfo.type === 'delivery') {
+        if (!deliveryInfo.address || !String(deliveryInfo.address).trim()) {
+          return res.status(400).json({ error: 'Delivery address is required for delivery orders' });
         }
-        const station = await PickupStation.findOne({ name: deliveryInfo.stationName });
+        if (!deliveryInfo.city || !String(deliveryInfo.city).trim()) {
+          return res.status(400).json({ error: 'Delivery city is required for delivery orders' });
+        }
+        if (!deliveryInfo.country || !String(deliveryInfo.country).trim()) {
+          return res.status(400).json({ error: 'Delivery country is required for delivery orders' });
+        }
+      }
+
+
+      // Resolve pickup station (prefer stationId, fallback to name for backward compatibility)
+      if (deliveryInfo.type === 'pickup') {
+        let station = null;
+
+        if (deliveryInfo.stationId) {
+          try {
+            station = await PickupStation.findById(deliveryInfo.stationId);
+          } catch (e) {
+            // Invalid ObjectId format — fall through to name lookup
+            station = null;
+          }
+        }
+
+        if (!station && deliveryInfo.stationName) {
+          station = await PickupStation.findOne({ name: deliveryInfo.stationName });
+        }
+
         if (!station) {
           return res.status(400).json({ error: 'Pickup station not found' });
         }
+
         deliveryInfo.stationId = station._id;
         deliveryInfo.stationName = station.name;
+        deliveryInfo.stationAddress = station.address;
+        deliveryInfo.stationCity = station.city;
       }
 
       // Calculate totals
@@ -260,7 +354,8 @@ router.post(
           productId: product._id,
           name: product.name,
           priceUSD: effectivePrice,
-          quantity: item.quantity
+          quantity: item.quantity,
+          vendorName: product.vendorName || null
         });
       }
 
@@ -455,6 +550,7 @@ router.post(
         customerEmail: req.user.email,
         customerPhone: req.body.customerPhone,
         deliveryInfo,
+        zone: zone || 'default',
         items: orderItems,
         subtotalUSD,
         discountAmountKES: finalDiscountAmount,
@@ -651,7 +747,7 @@ router.get('/:id', protect, async (req, res) => {
 router.put(
   '/:id/status',
   protect,
-  allowRoles('agent', 'admin', 'owner', 'station_manager'),
+  allowRoles('agent', 'admin', 'owner', 'station_manager', 'vendor'),
   sanitizeBody(['deliveryStatus']),
   [
     body('deliveryStatus')
@@ -667,6 +763,21 @@ router.put(
     try {
       const { deliveryStatus } = req.body;
       const order = await Order.findById(req.params.id);
+      if (!order) return res.status(404).json({ error: 'Order not found' });
+
+      // ===== VENDOR SCOPE + RESTRICTION =====
+      if (req.user.role === 'vendor') {
+        const myProductIds = await Product.find({ vendorId: req.user._id }).distinct('_id');
+        const myIdSet = new Set(myProductIds.map(id => id.toString()));
+        const hasMyProduct = order.items.some(it => myIdSet.has(it.productId.toString()));
+        if (!hasMyProduct) {
+          return res.status(403).json({ error: 'Order does not contain your products' });
+        }
+        if (deliveryStatus !== 'processing') {
+          return res.status(403).json({ error: 'Vendors can only mark orders as processing' });
+        }
+      }
+      // ===== END VENDOR SCOPE =====
 
       // ===== AGENT ASSIGNMENT CHECK =====
       if (req.user.role === 'agent') {
@@ -675,8 +786,6 @@ router.put(
         }
       }
       // ===== END CHECK =====
-
-      if (!order) return res.status(404).json({ error: 'Order not found' });
 
       if (req.user.role === 'station_manager') {
         const allowed = await canStationManageOrder(req.user._id, order);
@@ -859,7 +968,8 @@ router.put(
       const { amount, manualPaymentMethod, manualPaymentReference } = req.body;
       const verified = req.body.verified === true; // checkbox from frontend
 
-      const order = await Order.findById(req.params.id);
+      let order = await Order.findById(req.params.id);
+      if (!order) return res.status(404).json({ error: 'Order not found' });
 
       // ===== AGENT ASSIGNMENT CHECK =====
       if (req.user.role === 'agent') {
@@ -868,8 +978,6 @@ router.put(
         }
       }
       // ===== END CHECK =====
-
-      if (!order) return res.status(404).json({ error: 'Order not found' });
 
       // Station manager permission check
       if (req.user.role === 'station_manager') {
@@ -889,6 +997,60 @@ router.put(
         if (!manualPaymentReference || manualPaymentReference.trim() === '') {
           return res.status(400).json({
             error: 'Reference number (e.g., M-Pesa code, Bank ref) is required for this payment method.'
+          });
+        }
+      }
+
+      // 🔴 BLOCK: Rejected manual payments cannot be re-recorded without admin intervention
+      // Prevents infinite reject→resubmit loops and forces escalation to admin.
+      // Also logs each attempt for pattern analysis.
+      if (order.manualPaymentVerificationStatus === 'rejected' &&
+          ['bank_transfer', 'manual_mpesa'].includes(manualPaymentMethod)) {
+        try {
+          await logAction(req, 'record_rejected_payment_blocked', order.customerId, {
+            orderId: order._id,
+            attemptedMethod: manualPaymentMethod,
+            attemptedReference: manualPaymentReference || null,
+            attemptedAmount: amount
+          });
+        } catch (e) {
+          console.error('Failed to log rejected-payment attempt:', e.message);
+        }
+
+        return res.status(400).json({
+          error: 'A previous manual payment for this order was rejected by admin. Please contact admin before recording a new payment. If this is a legitimate payment, admin can clear the rejection.'
+        });
+      }
+
+
+      // 🔴 FRAUD PREVENTION: Reject duplicate M-Pesa references
+      if (manualPaymentMethod === 'manual_mpesa' && manualPaymentReference) {
+        const trimmedRef = manualPaymentReference.trim();
+        const existingWithRef = await Order.findOne({
+          _id: { $ne: order._id },
+          manualPaymentMethod: 'manual_mpesa',
+          manualPaymentReference: trimmedRef
+        });
+
+        if (existingWithRef) {
+          // Alert admins/owners — possible fraud attempt
+          try {
+            const adminsAndOwners = await User.find({ role: { $in: ['admin', 'owner'] } });
+            for (const recipient of adminsAndOwners) {
+              await createNotification(
+                recipient._id,
+                'system',
+                '🚨 Duplicate M-Pesa reference attempted',
+                `${req.user.fullName} (${req.user.role}) tried to record M-Pesa reference "${trimmedRef}" on order #${order.orderId}, but it is already used on order #${existingWithRef.orderId}.`,
+                '/admin.html?tab=manual_payments'
+              );
+            }
+          } catch (notifyErr) {
+            console.error('Duplicate-reference admin notification failed:', notifyErr.message);
+          }
+
+          return res.status(400).json({
+            error: `Reference "${trimmedRef}" was already recorded on order #${existingWithRef.orderId}. A payment reference can only be used once. If this is a mistake, contact admin.`
           });
         }
       }
@@ -1044,6 +1206,9 @@ router.put(
         return res.status(400).json({ error: 'This payment is not pending verification.' });
       }
 
+      // Capture the original recorder BEFORE overwriting manualPaymentVerifiedBy
+      const recorderId = order.manualPaymentVerifiedBy;
+
       // Update status
       order.manualPaymentVerificationStatus = verified ? 'verified' : 'rejected';
       order.manualPaymentVerifiedBy = req.user._id;
@@ -1056,16 +1221,18 @@ router.put(
 
       await order.save();
 
-      // Notify the agent who recorded it
-      await createNotification(
-        order.manualPaymentVerifiedBy,
-        'system',
-        verified ? '✅ Manual Payment Verified' : '❌ Manual Payment Rejected',
-        verified
-          ? `Order #${order.orderId} manual payment has been verified by admin.`
-          : `Order #${order.orderId} manual payment was rejected by admin. Please check the reference.`,
-        '/admin.html'
-      );
+      // Notify the agent who recorded it (not the admin who verified)
+      if (recorderId) {
+        await createNotification(
+          recorderId,
+          'system',
+          verified ? '✅ Manual Payment Verified' : '❌ Manual Payment Rejected',
+          verified
+            ? `Order #${order.orderId} manual payment has been verified by admin.`
+            : `Order #${order.orderId} manual payment was rejected by admin. Please check the reference.`,
+          '/account.html'
+        );
+      }
 
       res.json({
         success: true,

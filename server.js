@@ -230,6 +230,18 @@ app.post(
               ? Math.round(existingOrder.totalKES * ((existingOrder.depositPercentage || 0) / 100))
               : existingOrder.totalKES;
 
+            // ✅ Verify webhook amount matches expected amount (in cents)
+            // Stripe reports amounts in cents; we allow ±1 KES for rounding.
+            const expectedCents = expectedDeposit * 100;
+            if (Math.abs(paymentIntent.amount - expectedCents) > 100) {
+              console.error(
+                `❌ Stripe webhook amount mismatch for order ${orderId}: ` +
+                `expected ${expectedCents} cents (KES ${expectedDeposit}), ` +
+                `got ${paymentIntent.amount} cents. NOT marking paid.`
+              );
+              break;
+            }
+
             const claimedOrder = await Order.findOneAndUpdate(
               { _id: orderId, paymentStatus: 'pending' },
               {
@@ -360,6 +372,9 @@ mongoose
     ]);
     console.log('✅ Database indexes created');
     await seedCounters();
+    console.log('✅ Counters seeded');
+    await createOwnerIfNotExists();
+    console.log('✅ Owner creation check complete');
   })
   .catch((err) => console.error('❌ MongoDB connection error:', err));
 
@@ -377,7 +392,7 @@ async function createOwnerIfNotExists() {
     const userId = await User.getNextUserId();
     const ownerUser = new User({
       userId,
-      fullName: 'Mwecheche Official',
+      fullName: 'Mwechestore Official',
       email: ownerEmail,
       password: ownerPasswordHash || (await bcrypt.hash('ChangeMe123!', 12)),
       role: 'owner',
@@ -558,6 +573,47 @@ app.post('/api/mpesa/stkpush', protect, async (req, res) => {
   }
 });
 
+// ---------- M-Pesa STK status check (agent/station polls after sending STK) ----------
+app.get('/api/mpesa/stkpush/status/:orderId', protect, async (req, res) => {
+  try {
+    const order = await Order.findById(req.params.orderId);
+    if (!order) return res.status(404).json({ error: 'Order not found' });
+
+    const uid = req.user._id.toString();
+
+    // Authorization: order's customer, assigned agent, admin, owner, or pickup station manager
+    const isCustomer = order.customerId?.toString() === uid;
+    const isAssignedAgent = req.user.role === 'agent'
+      && order.assignedAgentId?.toString() === uid;
+    const isAdmin = ['admin', 'owner'].includes(req.user.role);
+    const isStationMgr = req.user.role === 'station_manager'
+      && order.deliveryInfo?.type === 'pickup'
+      && order.deliveryInfo?.stationId?.toString() === req.user.stationId?.toString();
+
+    if (!isCustomer && !isAssignedAgent && !isAdmin && !isStationMgr) {
+      return res.status(403).json({ error: 'Not authorized to view this order status' });
+    }
+
+    let status;
+    if (['fully_paid', 'deposit_paid', 'cash_collected'].includes(order.paymentStatus)) {
+      status = 'paid';
+    } else if (order.paymentStatus === 'payment_failed') {
+      status = 'failed';
+    } else {
+      status = 'pending';
+    }
+
+    res.json({
+      status,
+      paymentStatus: order.paymentStatus,
+      reason: order.mpesaFailureReason || null
+    });
+  } catch (err) {
+    console.error('STK status check error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // ---------- M‑Pesa Callback ----------
 app.post('/api/mpesa/callback', async (req, res) => {
   console.log('M-Pesa Callback received:', JSON.stringify(req.body, null, 2));
@@ -572,21 +628,6 @@ app.post('/api/mpesa/callback', async (req, res) => {
       (item) => item.Name === 'Amount'
     )?.Value;
     const accountRef = callbackData.AccountReference;
-
-    // ===== IDEMPOTENCY CHECK (Prevent double processing) =====
-
-    if (transactionId) {
-      // Check if this transaction ID already exists in orders
-      const existingOrder = await Order.findOne({ mpesaTransactionId: transactionId });
-      if (existingOrder) {
-        console.log(`⚠️ Duplicate M-Pesa callback for TXN: ${transactionId}. Ignoring.`);
-        return res.json({ ResultCode: 0, ResultDesc: 'Duplicate ignored' });
-      }
-      // Top-ups are deduplicated via the `status` field on TopUpRequest.
-      // Once a request is 'completed', a duplicate callback finds no pending
-      // record and exits safely. (No metadata field exists, so we don't query one.)
-    }
-    // ===== END IDEMPOTENCY CHECK =====
 
     console.log(`🔍 MerchantRequestID: ${merchantRequestId}, accountRef: ${accountRef}`);
 
@@ -653,11 +694,28 @@ app.post('/api/mpesa/callback', async (req, res) => {
       return res.status(404).json({ ResultCode: 1, ResultDesc: 'Order not found' });
     }
 
+    // Idempotency: if this order is already in a terminal paid state, ignore duplicate callback
+    if (['fully_paid', 'deposit_paid', 'cash_collected', 'refunded'].includes(order.paymentStatus)) {
+      console.log(`⚠️ Duplicate M-Pesa callback for order ${order.orderId} (already ${order.paymentStatus}). Ignoring.`);
+      return res.json({ ResultCode: 0, ResultDesc: 'Duplicate ignored' });
+    }
+
+
     if (resultCode === 0) {
       const isDeposit = order.paymentMethod === 'mpesa_deposit';
       const expectedDeposit = isDeposit
         ? Math.round(order.totalKES * ((order.depositPercentage || 0) / 100))
         : order.totalKES;
+
+      // ✅ Verify callback amount matches expected amount
+      if (amount != null && Math.abs(Number(amount) - expectedDeposit) > 1) {
+        console.error(
+          `❌ M-Pesa amount mismatch for order ${order.orderId}: ` +
+          `expected ${expectedDeposit}, got ${amount}. NOT marking paid.`
+        );
+        return res.json({ ResultCode: 1, ResultDesc: 'Amount mismatch' });
+      }
+
 
       const claimed = await Order.findOneAndUpdate(
         { _id: order._id, paymentStatus: 'pending' },
@@ -1086,10 +1144,12 @@ const PORT = process.env.PORT || 5000;
 
 async function start() {
   try {
-    // Wait for Mongo connection to be ready
+    // Wait for Mongo connection to be ready.
+    // Note: createOwnerIfNotExists() runs inside the mongoose.connect().then() chain
+    // above, so by the time asPromise() resolves AND the .then() handler completes,
+    // the owner has been created. But asPromise() may resolve before .then() finishes,
+    // so we don't rely on it here — the connect chain handles owner creation.
     await mongoose.connection.asPromise();
-    console.log('✅ Mongo connection ready');
-    await createOwnerIfNotExists();
 
     app.listen(PORT, () => {
       console.log(`🚀 Backend running on http://localhost:${PORT}`);

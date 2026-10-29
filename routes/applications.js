@@ -34,6 +34,23 @@ router.post('/', protect, async (req, res) => {
       status: 'pending'
     });
     await application.save();
+
+    // Notify owner on new application (fire-and-forget — don't fail the request if notification fails)
+    try {
+      const owners = await User.find({ role: 'owner' });
+      for (const owner of owners) {
+        await createNotification(
+          owner._id,
+          'system',
+          '📝 New Vendor/Agent Application',
+          `${req.user.fullName} (${req.user.email}) applied as ${role}. Review in Applications tab.`,
+          '/admin.html?tab=applications'
+        );
+      }
+    } catch (notifyErr) {
+      console.error('Application owner notification failed:', notifyErr.message);
+    }
+
     res.status(201).json({ message: 'Application submitted', application });
   } catch (err) {
     res.status(500).json({ error: err.message });

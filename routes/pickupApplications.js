@@ -30,6 +30,23 @@ router.post('/', protect, async (req, res) => {
     notes
   });
   await application.save();
+
+  // Notify owner on new pickup station application (fire-and-forget)
+  try {
+    const owners = await User.find({ role: 'owner' });
+    for (const owner of owners) {
+      await createNotification(
+        owner._id,
+        'system',
+        '📍 New Pickup Station Application',
+        `${req.user.fullName} (${req.user.email}) applied to open "${stationName}". Review in Applications tab.`,
+        '/admin.html?tab=applications'
+      );
+    }
+  } catch (notifyErr) {
+    console.error('Pickup application owner notification failed:', notifyErr.message);
+  }
+
   res.status(201).json({ message: 'Application submitted', application });
 });
 

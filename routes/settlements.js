@@ -39,6 +39,13 @@ router.get('/agent', protect, async (req, res) => {
 // Get settlements for current station manager
 router.get('/station', protect, async (req, res) => {
   try {
+    // Guard: if station manager has no assigned station, return empty.
+    // Without this, `{ stationId: null }` matches ALL delivery settlements
+    // (which have stationId: null by design) — a full platform data leak.
+    if (!req.user.stationId) {
+      return res.json([]);
+    }
+
     const settlements = await Settlement.find({ stationId: req.user.stationId })
       .populate('orderId', 'orderId totalKES')
       .sort({ createdAt: -1 });

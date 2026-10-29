@@ -18,7 +18,17 @@ router.get('/', async (req, res) => {
 // Admin CRUD
 router.post('/', protect, allowRoles('admin', 'owner'), async (req, res) => {
   try {
-    const banner = new Banner(req.body);
+    const { title, imageUrl, link, order } = req.body;
+
+    // Manual URL scheme validation — banners have no express-validator chain
+    if (!title || !imageUrl || !link) {
+      return res.status(400).json({ error: 'Missing required fields: title, imageUrl, link' });
+    }
+    if (!/^https?:\/\//i.test(imageUrl) || !/^https?:\/\//i.test(link)) {
+      return res.status(400).json({ error: 'imageUrl and link must be http/https URLs' });
+    }
+
+    const banner = new Banner({ title, imageUrl, link, order: order || 0 });
     await banner.save();
     res.status(201).json(banner);
   } catch (err) {
@@ -28,7 +38,26 @@ router.post('/', protect, allowRoles('admin', 'owner'), async (req, res) => {
 
 router.put('/:id', protect, allowRoles('admin', 'owner'), async (req, res) => {
   try {
-    const banner = await Banner.findByIdAndUpdate(req.params.id, req.body, { new: true });
+    const { title, imageUrl, link, order } = req.body;
+    const updates = {};
+    if (title !== undefined) updates.title = title;
+    if (imageUrl !== undefined) {
+      if (!/^https?:\/\//i.test(imageUrl)) {
+        return res.status(400).json({ error: 'imageUrl must be an http/https URL' });
+      }
+      updates.imageUrl = imageUrl;
+    }
+    if (link !== undefined) {
+      if (!/^https?:\/\//i.test(link)) {
+        return res.status(400).json({ error: 'link must be an http/https URL' });
+      }
+      updates.link = link;
+    }
+    if (order !== undefined) updates.order = order;
+    updates.updatedAt = Date.now();
+
+    const banner = await Banner.findByIdAndUpdate(req.params.id, updates, { new: true });
+    if (!banner) return res.status(404).json({ error: 'Banner not found' });
     res.json(banner);
   } catch (err) {
     res.status(500).json({ error: err.message });

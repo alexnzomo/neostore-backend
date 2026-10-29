@@ -40,9 +40,9 @@ router.post(
       .withMessage('Invalid ID type'),
     body('phoneNumber').trim().notEmpty().withMessage('Phone number is required'),
     body('address').trim().notEmpty().withMessage('Address is required'),
-    body('idPhotoUrl').isURL().withMessage('Valid ID photo URL required'),
-    body('selfiePhotoUrl').optional().isURL().withMessage('Selfie photo must be a valid URL'),
-    body('proofOfAddressUrl').optional().isURL().withMessage('Proof of address must be a valid URL'),
+    body('idPhotoUrl').isURL({ protocols: ['http', 'https'], require_protocol: true }).withMessage('Valid ID photo URL required (http/https)'),
+    body('selfiePhotoUrl').optional().isURL({ protocols: ['http', 'https'], require_protocol: true }).withMessage('Selfie photo must be a valid http/https URL'),
+    body('proofOfAddressUrl').optional().isURL({ protocols: ['http', 'https'], require_protocol: true }).withMessage('Proof of address must be a valid http/https URL'),
   ],
   async (req, res) => {
     // Log the incoming request for debugging
@@ -183,6 +183,20 @@ router.put(
       const kyc = await KYC.findById(req.params.id).populate('userId', 'fullName email');
       if (!kyc) {
         return res.status(404).json({ error: 'KYC record not found' });
+      }
+
+      // Guard: orphaned KYC record (user was deleted)
+      if (!kyc.userId) {
+        return res.status(404).json({
+          error: 'KYC user no longer exists. This record is orphaned — delete it or contact support.'
+        });
+      }
+
+      // Guard: admin cannot approve/reject their own KYC
+      if (kyc.userId._id.toString() === req.user._id.toString()) {
+        return res.status(403).json({
+          error: 'You cannot approve or reject your own KYC. Ask another admin or the owner.'
+        });
       }
 
       kyc.status = status;
