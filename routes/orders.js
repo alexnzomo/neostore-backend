@@ -228,7 +228,8 @@ router.post(
     body('deliveryInfo.type').isIn(['delivery', 'pickup']).withMessage('Invalid delivery type'),
     body('paymentMethod').isIn([
       'card', 'mpesa', 'cash_on_delivery',
-      'card_deposit', 'mpesa_deposit', 'wallet', 'wallet_deposit'
+      'card_deposit', 'mpesa_deposit', 'wallet', 'wallet_deposit',
+      'mpesa_on_delivery'
     ]).withMessage('Invalid payment method'),
     body('depositPercentage').optional().isFloat({ min: 0, max: 100 }).withMessage('Deposit must be 0-100'),
     body('discountAmountKES').optional().isFloat({ min: 0 }).withMessage('Discount must be non‑negative'),
@@ -535,7 +536,19 @@ router.post(
         // Full amount expected, but not yet collected.
         balanceDue = totalKES;
         paymentStatus = 'pending';
+      } else if (paymentMethod === 'mpesa_on_delivery') {
+        // Payment via STK when agent arrives — not collected now.
+        balanceDue = totalKES;
+        paymentStatus = 'pending';
       } else if (paymentMethod === 'cash_on_delivery') {
+        // Reject if cash is disabled by owner
+        const cashEnabledSetting = await Settings.findOne({ key: 'cash_enabled' });
+        const cashEnabled = cashEnabledSetting ? cashEnabledSetting.value === 'true' : true;
+        if (!cashEnabled) {
+          return res.status(400).json({
+            error: 'Cash on delivery is currently disabled. Please pay online or via M-Pesa on delivery.'
+          });
+        }
         balanceDue = totalKES;
         paymentStatus = 'pending';
       } else {
@@ -812,6 +825,17 @@ router.put(
         return res.status(400).json({ error: `Invalid transition from ${current} to ${next}` });
       }
       // ===== END TRANSITION VALIDATION =====
+
+      // ===== PAYMENT GUARD FOR DELIVERY =====
+      // Block transition to 'delivered' if any money is still owed.
+      // Covers cash_on_delivery, mpesa_on_delivery, and deposit orders with
+      // outstanding balance. Forces payment collection before delivery.
+      if (deliveryStatus === 'delivered' && order.remainingBalance > 0) {
+        return res.status(400).json({
+          error: `Cannot mark delivered: KES ${order.remainingBalance.toFixed(0)} still due. Collect payment first (record-cash or send STK push).`
+        });
+      }
+      // ===== END PAYMENT GUARD =====
 
       order.deliveryStatus = deliveryStatus;
       order.updatedAt = Date.now();
