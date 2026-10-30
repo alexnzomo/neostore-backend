@@ -181,11 +181,11 @@ router.post('/topup/initiate', protect, [
     const { amount, method, phoneNumber } = req.body;
     const userId = req.user._id;
 
-    // Stripe currency minimums — KES 50 is the effective minimum for Stripe.
+    // Stripe currency minimums — KES 70 is the effective minimum for Stripe.
     // Validated here so the user sees a clear error instead of a raw Stripe rejection.
-    if (method === 'stripe' && amount < 50) {
+    if (method === 'stripe' && amount < 70) {
       return res.status(400).json({
-        error: 'Minimum Stripe top-up is KES 50. For smaller amounts, please use M-Pesa.'
+        error: 'Minimum Stripe top-up is KES 70. For smaller amounts, please use M-Pesa.'
       });
     }
 

@@ -66,7 +66,7 @@ const orderSchema = new mongoose.Schema({
   deliveryStatus: { type: String, enum: ['pending', 'processing', 'shipped', 'out_for_delivery', 'ready_for_pickup', 'delivered', 'cancelled'], default: 'pending' },
   paymentMethod: { 
     type: String, 
-    enum: ['card', 'mpesa', 'cash_on_delivery', 'card_deposit', 'mpesa_deposit', 'wallet', 'wallet_deposit'],
+    enum: ['card', 'mpesa', 'cash_on_delivery', 'card_deposit', 'mpesa_deposit', 'wallet', 'wallet_deposit', 'mpesa_on_delivery'],
     required: true 
   },
   depositPaid: { type: Number, default: 0, min: 0 },

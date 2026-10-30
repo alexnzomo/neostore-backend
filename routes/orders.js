@@ -154,7 +154,7 @@ router.get('/', protect, allowRoles('admin', 'owner', 'station_manager', 'agent'
           { manualPaymentReference: { $regex: search, $options: 'i' } }
         ];
       }
-    }\
+    }
     // ---- End search filter ----
 
     let vendorProductIds = null; // set only for vendor role
