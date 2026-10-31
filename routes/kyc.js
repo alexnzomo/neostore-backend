@@ -120,7 +120,7 @@ router.post(
           'system',
           'New Identity Submission',
           `${req.user.fullName} (${req.user.email}) has submitted identity verification for review.`,
-          '/admin.html?tab=kyc'
+          '/admin?tab=kyc'
         );
       }
 
@@ -217,7 +217,7 @@ router.put(
         isVerified
           ? 'Your identity has been verified. You can now use all wallet features.'
           : `Your identity verification was rejected. Reason: ${adminNote || 'Please re-submit with correct documents.'}`,
-        '/account.html'
+        '/account'
       );
 
       console.log(`✅ KYC ${status} for user ${kyc.userId._id} by admin ${req.user._id}`);

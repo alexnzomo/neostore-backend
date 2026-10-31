@@ -139,7 +139,7 @@ router.put(
         'system',
         'Station Manager Assignment',
         `You have been assigned as manager of "${station.name}". Please visit your station dashboard.`,
-        '/station-manager.html'
+        '/station-manager'
       );
 
       res.json({ success: true, user: { id: user._id, stationId: user.stationId } });

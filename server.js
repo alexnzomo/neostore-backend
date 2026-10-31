@@ -214,7 +214,7 @@ app.post(
                 'system',
                 'Wallet top‑up successful',
                 `Your wallet has been credited with KES ${amount.toFixed(2)} via Stripe.`,
-                '/account.html'
+                '/account'
               );
             } catch (err) {
               console.error(`❌ Stripe wallet top-up FAILED for user ${userId}:`, err.message);
@@ -655,7 +655,7 @@ app.post('/api/mpesa/callback', async (req, res) => {
   } catch (e) {
     console.log('M-Pesa Callback: log error', e.message);
   }
-  
+
   try {
     const callbackData = req.body.Body.stkCallback;
     const resultCode = callbackData.ResultCode;
@@ -690,7 +690,7 @@ app.post('/api/mpesa/callback', async (req, res) => {
             'system',
             'Wallet top‑up successful',
             `Your wallet has been credited with KES ${topUp.amount.toFixed(2)} via M‑Pesa.`,
-            '/account.html'
+            '/account'
           );
         } catch (err) {
           console.error(`❌ M-Pesa wallet top-up FAILED for user ${topUp.userId}:`, err.message);
@@ -1131,7 +1131,7 @@ async function recoverTopUpViaStkQuery(topUp) {
         'system',
         'Wallet top-up successful',
         `Your wallet has been credited with KES ${claimed.amount.toFixed(2)} via M-Pesa.`,
-        '/account.html'
+        '/account'
       );
       console.log(`[STK recovery] Topup ${claimed._id} recovered.`);
     } catch (err) {

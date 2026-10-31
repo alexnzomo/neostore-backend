@@ -163,7 +163,7 @@ router.post('/topup', protect, allowRoles('owner'), [
       'system',
       'Wallet top‑up',
       `Your wallet has been credited with KES ${amount.toFixed(2)} by owner.`,
-      '/account.html'
+      '/account'
     );
 
     // Audit log
@@ -405,14 +405,14 @@ router.post('/transfer', protect, requireKYC, verifyTempToken, [
         'transfer',
         'Transfer sent',
         `You sent KES ${amount} to ${receiver.fullName || receiver.email}. New balance: KES ${result.senderBalance.toFixed(2)}`,
-        '/account.html'
+        '/account'
       );
       await createNotification(
         receiver._id,
         'transfer',
         'Transfer received',
         `You received KES ${amount} from ${sender.fullName || sender.email}. New balance: KES ${result.receiverBalance.toFixed(2)}`,
-        '/account.html'
+        '/account'
       );
     }
 

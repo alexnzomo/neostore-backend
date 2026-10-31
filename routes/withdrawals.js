@@ -146,7 +146,7 @@ router.post(
         'system',
         'Withdrawal request submitted',
         `Your withdrawal request of KES ${amount} has been submitted. A transaction cost of KES ${fee} was applied.`,
-        '/account.html'
+        '/account'
       );
 
       res.status(201).json(withdrawal);
@@ -255,7 +255,7 @@ router.put(
           'system',
           'Withdrawal approved',
           `Your withdrawal request of KES ${withdrawal.amount} has been approved and is being processed.`,
-          '/account.html'
+          '/account'
         );
 
       } else if (status === 'rejected') {
@@ -284,7 +284,7 @@ router.put(
           'system',
           'Withdrawal rejected',
           `Your withdrawal request of KES ${withdrawal.amount} has been rejected and the funds refunded. Reason: ${adminNote || 'No reason provided.'}`,
-          '/account.html'
+          '/account'
         );
 
       } else if (status === 'completed') {
@@ -309,7 +309,7 @@ router.put(
           'system',
           'Withdrawal completed',
           `Your withdrawal request of KES ${withdrawal.amount} has been completed. Funds have been sent to your ${withdrawal.method} account.`,
-          '/account.html'
+          '/account'
         );
       }
 
