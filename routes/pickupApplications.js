@@ -11,7 +11,8 @@ const router = express.Router();
 // Submit a pickup station application (logged-in user)
 router.post('/', protect, async (req, res) => {
   const { stationName, address, city, county, phone, email, hours, notes } = req.body;
-  if (!stationName || !address || !city || !county || !phone) {
+  if (!stationName || !address || !city || !county || !phone ||
+      !nationalId || !idImageUrl || !proofOfAddress || !proofOfStationAddress || !dob) {
     return res.status(400).json({ error: 'Missing required fields' });
   }
   const existing = await PickupApplication.findOne({ userId: req.user._id, status: 'pending' });

@@ -216,7 +216,7 @@ router.put(
         isVerified ? '✅ KYC Approved' : '❌ KYC Rejected',
         isVerified
           ? 'Your KYC verification has been approved. You can now use all wallet features.'
-          : `Your KYC verification was rejected. Reason: ${adminNote || 'Please re‑submit with correct documents.'}`,
+          : `verification was rejected. Reason: ${adminNote || 'Please re‑submit with correct documents.'}`,
         '/account.html'
       );
 

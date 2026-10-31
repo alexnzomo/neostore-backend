@@ -49,6 +49,7 @@ const notificationRoutes = require('./routes/notifications');
 const auditRoutes = require('./routes/audit');
 const reportRoutes = require('./routes/reports');
 const verificationRoutes = require('./routes/verification');
+const documentRoutes = require('./routes/documents');
 
 // ========== Middleware ==========
 const { protect } = require('./middleware/auth');
@@ -427,6 +428,7 @@ app.use('/api/notifications', notificationRoutes);
 app.use('/api/audit', auditRoutes);
 app.use('/api/reports', reportRoutes);
 app.use('/api', verificationRoutes);
+app.use('/api/documents', documentRoutes);
 
 // ---------- M‑Pesa Configuration ----------
 const CONSUMER_KEY = process.env.CONSUMER_KEY;
