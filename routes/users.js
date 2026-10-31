@@ -224,6 +224,45 @@ router.put(
   }
 );
 
+// Toggle finance approver privilege for an admin (owner only)
+router.put(
+  '/:id/finance-role',
+  protect,
+  allowRoles('owner'),
+  sanitizeBody(['canApproveWithdrawals']),
+  [
+    body('canApproveWithdrawals').isBoolean().withMessage('Must be true or false'),
+  ],
+  async (req, res) => {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) return res.status(400).json({ errors: errors.array() });
+
+    try {
+      const { canApproveWithdrawals } = req.body;
+      const user = await User.findById(req.params.id);
+      if (!user) return res.status(404).json({ error: 'User not found' });
+      if (user.role === 'owner') {
+        return res.status(400).json({ error: 'Owner always has approval rights — no flag needed' });
+      }
+      if (user.role !== 'admin') {
+        return res.status(400).json({ error: 'Finance approver role only applies to admin users' });
+      }
+
+      user.canApproveWithdrawals = canApproveWithdrawals;
+      await user.save();
+
+      await logAction(req, 'finance_role_change', user._id, { canApproveWithdrawals });
+
+      res.json({
+        success: true,
+        user: { id: user._id, canApproveWithdrawals: user.canApproveWithdrawals }
+      });
+    } catch (err) {
+      res.status(500).json({ error: err.message });
+    }
+  }
+);
+
 // Delete user (owner only)
 router.delete('/:id', protect, allowRoles('owner'), async (req, res) => {
   try {

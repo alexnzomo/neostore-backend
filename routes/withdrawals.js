@@ -124,6 +124,8 @@ router.post(
       );
 
       // 6. Create the request, saving the fee!
+      // Owner's own withdrawals auto-approve (bypasses threshold, no self-approval loop).
+      const isOwnerRequest = req.user.role === 'owner';
       const withdrawal = new Withdrawal({
         userId: req.user._id,
         amount,
@@ -131,7 +133,9 @@ router.post(
         method,
         bankDetails: method === 'bank' ? bankDetails : null,
         mpesaNumber: method === 'mpesa' ? mpesaNumber : null,
-        status: 'pending'
+        status: isOwnerRequest ? 'approved' : 'pending',
+        reviewedBy: isOwnerRequest ? req.user._id : undefined,
+        reviewedAt: isOwnerRequest ? new Date() : undefined
       });
       await withdrawal.save();
 
@@ -141,7 +145,7 @@ router.post(
         req.user._id,
         'system',
         'Withdrawal request submitted',
-        `Your withdrawal request of KES ${amount} has been submitted for review. A fee of KES ${fee} was applied.`,
+        `Your withdrawal request of KES ${amount} has been submitted. A transaction cost of KES ${fee} was applied.`,
         '/account.html'
       );
 
@@ -215,6 +219,26 @@ router.put(
       if (!withdrawal) {
         return res.status(404).json({ error: 'Withdrawal not found' });
       }
+
+      // ===== Withdrawal approval policy (FIX 8.2) =====
+      // Only owner, or admins explicitly flagged with canApproveWithdrawals,
+      // can approve/reject/complete withdrawals. Non-owner admins are further
+      // limited by the amount threshold.
+      if (req.user.role !== 'owner') {
+        if (!req.user.canApproveWithdrawals) {
+          return res.status(403).json({
+            error: 'You do not have permission to manage withdrawals. Contact the owner.'
+          });
+        }
+        const thresholdSetting = await Settings.findOne({ key: 'withdrawal_approval_threshold' });
+        const threshold = thresholdSetting ? thresholdSetting.value : 20000;
+        if (withdrawal.amount > threshold) {
+          return res.status(403).json({
+            error: `Withdrawals above KES ${threshold} require owner approval. This one is KES ${withdrawal.amount}.`
+          });
+        }
+      }
+      // ===== End policy check =====
 
       if (status === 'approved') {
         if (withdrawal.status !== 'pending') {

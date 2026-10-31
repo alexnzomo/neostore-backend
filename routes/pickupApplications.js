@@ -10,55 +10,89 @@ const router = express.Router();
 
 // Submit a pickup station application (logged-in user)
 router.post('/', protect, async (req, res) => {
-  const { stationName, address, city, county, phone, email, hours, notes } = req.body;
-  if (!stationName || !address || !city || !county || !phone ||
-      !nationalId || !idImageUrl || !proofOfAddress || !proofOfStationAddress || !dob) {
-    return res.status(400).json({ error: 'Missing required fields' });
-  }
-  const existing = await PickupApplication.findOne({ userId: req.user._id, status: 'pending' });
-  if (existing) return res.status(400).json({ error: 'You already have a pending application' });
-  const application = new PickupApplication({
-    userId: req.user._id,
-    userName: req.user.fullName,
-    userEmail: req.user.email,
-    stationName,
-    address,
-    city,
-    county,
-    phone,
-    email,
-    hours,
-    notes
-  });
-  await application.save();
-
-  // Notify owner on new pickup station application (fire-and-forget)
   try {
-    const owners = await User.find({ role: 'owner' });
-    for (const owner of owners) {
-      await createNotification(
-        owner._id,
-        'system',
-        '📍 New Pickup Station Application',
-        `${req.user.fullName} (${req.user.email}) applied to open "${stationName}". Review in Applications tab.`,
-        '/admin.html?tab=applications'
-      );
-    }
-  } catch (notifyErr) {
-    console.error('Pickup application owner notification failed:', notifyErr.message);
-  }
+    const {
+      stationName, address, city, county, phone, email, hours, notes,
+      nationalId, idImageUrl, proofOfAddress, proofOfStationAddress, dob, country
+    } = req.body;
 
-  res.status(201).json({ message: 'Application submitted', application });
+    // Station details — required
+    if (!stationName || !address || !city || !county || !phone) {
+      return res.status(400).json({
+        error: 'Missing required station fields (name, address, city, county, phone)'
+      });
+    }
+
+    // KYC fields — required
+    if (!nationalId || !idImageUrl || !proofOfAddress || !proofOfStationAddress || !dob) {
+      return res.status(400).json({
+        error: 'Missing required identity fields (nationalId, idImageUrl, proofOfAddress, proofOfStationAddress, dob)'
+      });
+    }
+
+    // No duplicate pending applications
+    const existing = await PickupApplication.findOne({ userId: req.user._id, status: 'pending' });
+    if (existing) {
+      return res.status(400).json({ error: 'You already have a pending application' });
+    }
+
+    const application = new PickupApplication({
+      userId: req.user._id,
+      userName: req.user.fullName,
+      userEmail: req.user.email,
+      stationName,
+      address,
+      city,
+      county,
+      country: country || 'Kenya',
+      phone,
+      email: email || '',
+      hours: hours || '',
+      notes: notes || '',
+      // KYC fields
+      nationalId,
+      idImageUrl,
+      proofOfAddress,
+      proofOfStationAddress,
+      dob: new Date(dob)
+    });
+    await application.save();
+
+    // Notify owner on new pickup station application (fire-and-forget)
+    try {
+      const owners = await User.find({ role: 'owner' });
+      for (const owner of owners) {
+        await createNotification(
+          owner._id,
+          'system',
+          '📍 New Pickup Station Application',
+          `${req.user.fullName} (${req.user.email}) applied to open "${stationName}". Review in Applications tab.`,
+          '/admin.html?tab=applications'
+        );
+      }
+    } catch (notifyErr) {
+      console.error('Pickup application owner notification failed:', notifyErr.message);
+    }
+
+    res.status(201).json({ message: 'Application submitted', application });
+  } catch (err) {
+    console.error('Pickup application submission error:', err);
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // Get all pending applications (admin/owner only)
 router.get('/pending', protect, allowRoles('admin', 'owner'), async (req, res) => {
-  const apps = await PickupApplication.find({ status: 'pending' }).sort({ submittedAt: -1 });
-  res.json(apps);
+  try {
+    const apps = await PickupApplication.find({ status: 'pending' }).sort({ submittedAt: -1 });
+    res.json(apps);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
-// Approve or reject application (admin/owner)
-router.put('/:id', protect, allowRoles('admin', 'owner'), async (req, res) => {
+// Approve or reject application (owner only — pickup stations handle money/inventory)
+router.put('/:id', protect, allowRoles('owner'), async (req, res) => {
   try {
     const { status } = req.body;
     if (!['approved', 'rejected'].includes(status)) {

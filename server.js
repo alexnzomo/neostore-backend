@@ -130,7 +130,7 @@ app.set('trust proxy', 1);
 // ---------- Rate limiting ----------
 const globalLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
-  limit: 200,
+  limit: 500,
   skip: (req) => req.path.startsWith('/api/notifications') || req.path === '/api/health',
 });
 app.use('/api/', globalLimiter);
@@ -150,7 +150,26 @@ const resetLimiter = rateLimit({
   skipSuccessfulRequests: true,
 });
 app.use('/api/send-reset-code', resetLimiter);
+
 app.use('/api/verify-reset-code', resetLimiter);
+// PIN OTP rate limit — prevents email spam via /wallet/pin/request-otp
+const pinOtpLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  limit: 5,
+  skipSuccessfulRequests: false,
+});
+app.use('/api/wallet/pin/request-otp', pinOtpLimiter);
+
+// Order creation rate limit — prevents stock-depletion DoS via rapid order creation
+const orderCreateLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  limit: 10,
+  message: { error: 'Too many orders in a short period. Please wait and try again.' },
+});
+app.use('/api/orders', (req, res, next) => {
+  if (req.method === 'POST') return orderCreateLimiter(req, res, next);
+  next();
+});
 
 // ---------- Stripe webhook (raw body) ----------
 app.post(
@@ -300,7 +319,7 @@ app.post(
 );
 
 // ---------- JSON parser (after webhook) ----------
-app.use(express.json({ limit: '10mb' }));
+app.use(express.json({ limit: '1mb' }));
 
 // ========== ✅ Attach CSRF helper ==========
 app.use((req, res, next) => {
@@ -618,7 +637,25 @@ app.get('/api/mpesa/stkpush/status/:orderId', protect, async (req, res) => {
 
 // ---------- M‑Pesa Callback ----------
 app.post('/api/mpesa/callback', async (req, res) => {
-  console.log('M-Pesa Callback received:', JSON.stringify(req.body, null, 2));
+  // Log only non-PII fields. Full payload may contain phone numbers.
+  try {
+    const cb = req.body?.Body?.stkCallback;
+    if (cb) {
+      console.log('M-Pesa Callback:', JSON.stringify({
+        MerchantRequestID: cb.MerchantRequestID,
+        CheckoutRequestID: cb.CheckoutRequestID,
+        ResultCode: cb.ResultCode,
+        ResultDesc: cb.ResultDesc,
+        Amount: cb.CallbackMetadata?.Item?.find(i => i.Name === 'Amount')?.Value,
+        Receipt: cb.CallbackMetadata?.Item?.find(i => i.Name === 'MpesaReceiptNumber')?.Value
+      }, null, 2));
+    } else {
+      console.log('M-Pesa Callback: malformed body');
+    }
+  } catch (e) {
+    console.log('M-Pesa Callback: log error', e.message);
+  }
+  
   try {
     const callbackData = req.body.Body.stkCallback;
     const resultCode = callbackData.ResultCode;

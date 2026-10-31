@@ -118,13 +118,13 @@ router.post(
         await createNotification(
           admin._id,
           'system',
-          'New KYC Submission',
-          `${req.user.fullName} (${req.user.email}) has submitted KYC for review.`,
+          'New Identity Submission',
+          `${req.user.fullName} (${req.user.email}) has submitted identity verification for review.`,
           '/admin.html?tab=kyc'
         );
       }
 
-      res.status(201).json({ success: true, message: 'KYC submitted for review' });
+      res.status(201).json({ success: true, message: 'Identity verification submitted for review' });
     } catch (err) {
       console.error('❌ KYC submission error:', err);
       res.status(500).json({
@@ -213,10 +213,10 @@ router.put(
       await createNotification(
         kyc.userId._id,
         'system',
-        isVerified ? '✅ KYC Approved' : '❌ KYC Rejected',
+        isVerified ? '✅ Identity Verified' : '❌ Identity Verification Rejected',
         isVerified
-          ? 'Your KYC verification has been approved. You can now use all wallet features.'
-          : `verification was rejected. Reason: ${adminNote || 'Please re‑submit with correct documents.'}`,
+          ? 'Your identity has been verified. You can now use all wallet features.'
+          : `Your identity verification was rejected. Reason: ${adminNote || 'Please re-submit with correct documents.'}`,
         '/account.html'
       );
 

@@ -15,8 +15,18 @@ const pickupApplicationSchema = new mongoose.Schema({
   location: {
     type: { type: String, enum: ['Point'], default: 'Point' },
     coordinates: { type: [Number], index: '2dsphere' }
-  },  
+  },
   notes: { type: String },
+
+  // ===== KYC fields (added in FIX 6.2) =====
+  // Required for new applications; nullable for legacy applications created before FIX 6.2
+  nationalId: { type: String, default: null },
+  idImageUrl: { type: String, default: null },         // Cloudinary URL — personal ID document
+  proofOfAddress: { type: String, default: null },     // Cloudinary URL — personal proof of address
+  proofOfStationAddress: { type: String, default: null }, // Cloudinary URL — proof station exists at claimed address
+  dob: { type: Date, default: null },
+  // ===== End KYC fields =====
+
   status: { type: String, enum: ['pending', 'approved', 'rejected'], default: 'pending' },
   submittedAt: { type: Date, default: Date.now },
   reviewedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },

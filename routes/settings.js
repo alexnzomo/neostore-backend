@@ -370,6 +370,25 @@ router.put('/shipping-rates', protect, allowRoles('owner'), async (req, res) => 
   res.json({ success: true, rates });
 });
 
+// ========== Withdrawal Approval Threshold ==========
+router.get('/withdrawal-approval-threshold', async (req, res) => {
+  const value = await getSetting('withdrawal_approval_threshold');
+  res.json({ value: value !== null ? value : 20000 });
+});
+
+router.put('/withdrawal-approval-threshold', protect, allowRoles('owner'), async (req, res) => {
+  const { value } = req.body;
+  if (typeof value !== 'number' || value < 0) {
+    return res.status(400).json({ error: 'Value must be a non-negative number' });
+  }
+  await Settings.findOneAndUpdate(
+    { key: 'withdrawal_approval_threshold' },
+    { key: 'withdrawal_approval_threshold', value },
+    { upsert: true, new: true }
+  );
+  res.json({ success: true, value });
+});
+
 // ========== Withdrawal Fee Structure ==========
 router.get('/withdrawalFeeFlat', async (req, res) => {
   const value = await getSetting('withdrawalFeeFlat');

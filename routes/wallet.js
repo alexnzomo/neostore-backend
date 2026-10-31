@@ -120,6 +120,12 @@ router.get('/transactions/user/:userId', protect, allowRoles('admin', 'owner'), 
     const { userId } = req.params;
     const user = await User.findById(userId);
     if (!user) return res.status(404).json({ error: 'User not found' });
+
+    // Audit log: any non-owner admin viewing another user's transaction history
+    if (req.user.role !== 'owner') {
+      await logAction(req, 'view_user_transactions', userId, {});
+    }
+
     const transactions = await WalletTransaction.find({ userId })
       .sort({ createdAt: -1 })
       .limit(100);

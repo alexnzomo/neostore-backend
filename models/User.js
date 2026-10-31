@@ -18,6 +18,8 @@ const userSchema = new mongoose.Schema({
   },
   isSuspended: { type: Boolean, default: false },
   suspendedUntil: { type: Date },
+  // Owner-assigned finance privilege — can approve withdrawals up to the threshold
+  canApproveWithdrawals: { type: Boolean, default: false },
   walletBalance: { type: Number, default: 0, min: 0 },
   stationId: { type: mongoose.Schema.Types.ObjectId, ref: 'PickupStation', default: null }, // ✅ ADDED
   location: {
