@@ -162,7 +162,7 @@ router.post('/topup', protect, allowRoles('owner'), [
       userId,
       'system',
       'Wallet top‑up',
-      `Your wallet has been credited with KES ${amount.toFixed(2)} by owner.`,
+      `Your wallet has been credited with KES ${amount.toFixed(2)} by an administrator.`,
       '/account.html'
     );
 
