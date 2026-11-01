@@ -13,7 +13,7 @@ const walletTransactionSchema = new mongoose.Schema({
   description: { type: String, required: true },
   referenceId: { type: String },
   // ✅ Updated: added 'settlement' and 'withdrawal'
-  referenceType: { type: String, enum: ['order', 'topup', 'transfer', 'refund', 'settlement', 'withdrawal', 'sponsorship'] },
+  referenceType: { type: String, enum: ['order', 'topup', 'transfer', 'refund', 'settlement', 'withdrawal', 'sponsorship', 'referral'] },
   pairTransactionId: { type: mongoose.Schema.Types.ObjectId, ref: 'WalletTransaction' },
   metadata: { type: mongoose.Schema.Types.Mixed, default: {} },
   status: {

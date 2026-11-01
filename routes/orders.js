@@ -1085,7 +1085,7 @@ router.put(
         const enabledSetting = await Settings.findOne({ key: 'cash_enabled' });
         const cashEnabled = enabledSetting ? enabledSetting.value === 'true' : true;
         if (!cashEnabled) {
-          return res.status(403).json({ error: 'Cash payments are currently disabled by the owner.' });
+          return res.status(403).json({ error: 'Cash payments are temporarily unavailable. Please choose M-Pesa or card.' });
         }
 
         // 2. Per‑order limit

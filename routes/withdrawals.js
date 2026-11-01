@@ -146,7 +146,7 @@ router.post(
         'system',
         'Withdrawal request submitted',
         `Your withdrawal request of KES ${amount} has been submitted. A transaction cost of KES ${fee} was applied.`,
-        '/account'
+        '/account.html'
       );
 
       res.status(201).json(withdrawal);
@@ -227,14 +227,14 @@ router.put(
       if (req.user.role !== 'owner') {
         if (!req.user.canApproveWithdrawals) {
           return res.status(403).json({
-            error: 'You do not have permission to manage withdrawals. Contact the owner.'
+            error: 'You do not have permission to manage withdrawals. Contact a senior administrator.'
           });
         }
         const thresholdSetting = await Settings.findOne({ key: 'withdrawal_approval_threshold' });
         const threshold = thresholdSetting ? thresholdSetting.value : 20000;
         if (withdrawal.amount > threshold) {
           return res.status(403).json({
-            error: `Withdrawals above KES ${threshold} require owner approval. This one is KES ${withdrawal.amount}.`
+            error: `Withdrawals above KES ${threshold} require senior approval. This one is KES ${withdrawal.amount}.`
           });
         }
       }
@@ -255,7 +255,7 @@ router.put(
           'system',
           'Withdrawal approved',
           `Your withdrawal request of KES ${withdrawal.amount} has been approved and is being processed.`,
-          '/account'
+          '/account.html'
         );
 
       } else if (status === 'rejected') {
@@ -284,7 +284,7 @@ router.put(
           'system',
           'Withdrawal rejected',
           `Your withdrawal request of KES ${withdrawal.amount} has been rejected and the funds refunded. Reason: ${adminNote || 'No reason provided.'}`,
-          '/account'
+          '/account.html'
         );
 
       } else if (status === 'completed') {
@@ -309,7 +309,7 @@ router.put(
           'system',
           'Withdrawal completed',
           `Your withdrawal request of KES ${withdrawal.amount} has been completed. Funds have been sent to your ${withdrawal.method} account.`,
-          '/account'
+          '/account.html'
         );
       }
 

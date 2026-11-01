@@ -63,13 +63,13 @@ router.put(
 
       const oldRole = user.role; // ✅ for audit log
       if (user.role === 'owner' && role !== 'owner') {
-        return res.status(403).json({ error: 'Cannot demote the platform owner' });
+        return res.status(403).json({ error: 'Cannot demote the platform principal' });
       }
 
       // Guard: no user can change their own role
       if (user._id.toString() === req.user._id.toString() && role !== user.role) {
         return res.status(403).json({
-          error: 'You cannot change your own role. Ask another owner to change it.'
+          error: 'You cannot change your own role. Ask another user with sufficient privileges to change it.'
         });
       }
 
@@ -139,7 +139,7 @@ router.put(
         'system',
         'Station Manager Assignment',
         `You have been assigned as manager of "${station.name}". Please visit your station dashboard.`,
-        '/station-manager'
+        '/station_manager.html'
       );
 
       res.json({ success: true, user: { id: user._id, stationId: user.stationId } });
@@ -202,12 +202,12 @@ router.put(
       const { isSuspended, suspendedUntil } = req.body;
       const user = await User.findById(req.params.id);
       if (!user) return res.status(404).json({ error: 'User not found' });
-      if (user.role === 'owner') return res.status(403).json({ error: 'Cannot suspend the owner' });
+      if (user.role === 'owner') return res.status(403).json({ error: 'Cannot suspend the platform principal'});
 
       // Guard: only owner can suspend another admin
       if (user.role === 'admin' && req.user.role !== 'owner') {
         return res.status(403).json({
-          error: 'Only the owner can suspend another admin.'
+          error: 'Only a user with sufficient privileges can suspend another administrator.'
         });
       }
 
@@ -242,7 +242,7 @@ router.put(
       const user = await User.findById(req.params.id);
       if (!user) return res.status(404).json({ error: 'User not found' });
       if (user.role === 'owner') {
-        return res.status(400).json({ error: 'Owner always has approval rights — no flag needed' });
+        return res.status(400).json({ error: 'Platform principal always has approval rights — no flag needed' });
       }
       if (user.role !== 'admin') {
         return res.status(400).json({ error: 'Finance approver role only applies to admin users' });
@@ -268,7 +268,7 @@ router.delete('/:id', protect, allowRoles('owner'), async (req, res) => {
   try {
     const user = await User.findById(req.params.id);
     if (!user) return res.status(404).json({ error: 'User not found' });
-    if (user.role === 'owner') return res.status(403).json({ error: 'Cannot delete the owner' });
+    if (user.role === 'owner') return res.status(403).json({ error: 'Cannot delete the platform principal' });
 
     // Refuse if the user has active orders (as customer or agent).
     // Otherwise orders keep a dangling customerId / assignedAgentId,

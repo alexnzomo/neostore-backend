@@ -120,7 +120,7 @@ router.post(
           'system',
           'New Identity Submission',
           `${req.user.fullName} (${req.user.email}) has submitted identity verification for review.`,
-          '/admin?tab=kyc'
+          '/admin.html?tab=kyc'
         );
       }
 
@@ -195,7 +195,7 @@ router.put(
       // Guard: admin cannot approve/reject their own KYC
       if (kyc.userId._id.toString() === req.user._id.toString()) {
         return res.status(403).json({
-          error: 'You cannot approve or reject your own KYC. Ask another admin or the owner.'
+          error: 'You cannot approve or reject your own KYC. Ask another administrator to review it.'
         });
       }
 
@@ -217,7 +217,7 @@ router.put(
         isVerified
           ? 'Your identity has been verified. You can now use all wallet features.'
           : `Your identity verification was rejected. Reason: ${adminNote || 'Please re-submit with correct documents.'}`,
-        '/account'
+        '/account.html'
       );
 
       console.log(`✅ KYC ${status} for user ${kyc.userId._id} by admin ${req.user._id}`);

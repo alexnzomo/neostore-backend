@@ -152,7 +152,7 @@ router.post('/topup', protect, allowRoles('owner'), [
     const result = await WalletService.credit(
       userId,
       amount,
-      `Manual top‑up by owner ${req.user.fullName}`,
+      `Manual top‑up by administrator ${req.user.fullName}`,
       null,
       'topup',
       { adminId: req.user._id }
@@ -163,7 +163,7 @@ router.post('/topup', protect, allowRoles('owner'), [
       'system',
       'Wallet top‑up',
       `Your wallet has been credited with KES ${amount.toFixed(2)} by owner.`,
-      '/account'
+      '/account.html'
     );
 
     // Audit log
@@ -405,14 +405,14 @@ router.post('/transfer', protect, requireKYC, verifyTempToken, [
         'transfer',
         'Transfer sent',
         `You sent KES ${amount} to ${receiver.fullName || receiver.email}. New balance: KES ${result.senderBalance.toFixed(2)}`,
-        '/account'
+        '/account.html'
       );
       await createNotification(
         receiver._id,
         'transfer',
         'Transfer received',
         `You received KES ${amount} from ${sender.fullName || sender.email}. New balance: KES ${result.receiverBalance.toFixed(2)}`,
-        '/account'
+        '/account.html'
       );
     }
 

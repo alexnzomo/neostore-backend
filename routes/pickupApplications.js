@@ -67,7 +67,7 @@ router.post('/', protect, async (req, res) => {
           'system',
           '📍 New Pickup Station Application',
           `${req.user.fullName} (${req.user.email}) applied to open "${stationName}". Review in Applications tab.`,
-          '/admin?tab=applications'
+          '/admin.html?tab=applications'
         );
       }
     } catch (notifyErr) {
@@ -161,7 +161,7 @@ router.put('/:id', protect, allowRoles('owner'), async (req, res) => {
         'system',
         '✅ Pickup Station Approved',
         `Your application for "${application.stationName}" has been approved. You are now a station manager.`,
-        '/station_manager'
+        '/station_manager.html'
       );
     } else {
       await createNotification(
@@ -169,7 +169,7 @@ router.put('/:id', protect, allowRoles('owner'), async (req, res) => {
         'system',
         '❌ Pickup Station Rejected',
         `Your application for "${application.stationName}" was not approved.`,
-        '/account'
+        '/account.html'
       );
     }
 

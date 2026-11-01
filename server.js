@@ -214,7 +214,7 @@ app.post(
                 'system',
                 'Wallet top‑up successful',
                 `Your wallet has been credited with KES ${amount.toFixed(2)} via Stripe.`,
-                '/account'
+                '/account.html'
               );
             } catch (err) {
               console.error(`❌ Stripe wallet top-up FAILED for user ${userId}:`, err.message);
@@ -637,6 +637,24 @@ app.get('/api/mpesa/stkpush/status/:orderId', protect, async (req, res) => {
 
 // ---------- M‑Pesa Callback ----------
 app.post('/api/mpesa/callback', async (req, res) => {
+  // ========== SECRET VERIFICATION ==========
+  // Prevents spoofed callbacks. M-Pesa echoes the registered CALLBACK_URL,
+  // which includes ?secret=... — any request without the correct secret is rejected.
+  const expectedSecret = process.env.MPESA_CALLBACK_SECRET;
+  const providedSecret = req.query.secret;
+  if (!expectedSecret) {
+    console.error('❌ MPESA_CALLBACK_SECRET not set — rejecting all callbacks for safety');
+    return res.status(500).json({ ResultCode: 1, ResultDesc: 'Server misconfigured' });
+  }
+  if (!providedSecret || providedSecret !== expectedSecret) {
+    console.warn('❌ M-Pesa callback rejected: missing or invalid secret', {
+      ip: req.ip,
+      hasSecret: !!providedSecret,
+    });
+    return res.status(403).json({ ResultCode: 1, ResultDesc: 'Forbidden' });
+  }
+  // ========== END SECRET VERIFICATION ==========
+
   // Log only non-PII fields. Full payload may contain phone numbers.
   try {
     const cb = req.body?.Body?.stkCallback;
@@ -690,7 +708,7 @@ app.post('/api/mpesa/callback', async (req, res) => {
             'system',
             'Wallet top‑up successful',
             `Your wallet has been credited with KES ${topUp.amount.toFixed(2)} via M‑Pesa.`,
-            '/account'
+            '/account.html'
           );
         } catch (err) {
           console.error(`❌ M-Pesa wallet top-up FAILED for user ${topUp.userId}:`, err.message);
@@ -1131,7 +1149,7 @@ async function recoverTopUpViaStkQuery(topUp) {
         'system',
         'Wallet top-up successful',
         `Your wallet has been credited with KES ${claimed.amount.toFixed(2)} via M-Pesa.`,
-        '/account'
+        '/account.html'
       );
       console.log(`[STK recovery] Topup ${claimed._id} recovered.`);
     } catch (err) {

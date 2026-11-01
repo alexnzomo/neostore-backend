@@ -160,7 +160,7 @@ async function sendStationAssignmentEmail(user, station) {
     <p><strong>Address:</strong> ${station.address}, ${station.city}</p>
     <p><strong>Phone:</strong> ${station.phone}</p>
     <p style="text-align: center; margin-top: 24px;">
-      <a href="${FRONTEND_URL}/station-manager.html" style="background: #1c1c1e; color: white; padding: 10px 24px; border-radius: 40px; text-decoration: none; display: inline-block;">Go to dashboard →</a>
+      <a href="${FRONTEND_URL}/station_manager.html" style="background: #1c1c1e; color: white; padding: 10px 24px; border-radius: 40px; text-decoration: none; display: inline-block;">Go to dashboard →</a>
     </p>
   `;
   return sendEmail({

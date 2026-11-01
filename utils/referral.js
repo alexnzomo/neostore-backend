@@ -59,7 +59,7 @@ async function processReferralReward(order) {
     reward,
     `Referral bonus (${referralPercentage}% of commission): ${customer.fullName} placed order #${order.orderId}`,
     order._id,
-    'refund'
+    'referral'
   );
 
   await createNotification(
