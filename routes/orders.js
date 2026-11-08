@@ -948,6 +948,11 @@ router.put(
         return res.status(400).json({ error: 'Only cash on delivery orders can be confirmed this way' });
       }
 
+      // Prevent collecting cash for cancelled or refunded orders
+      if (['cancelled', 'refunded'].includes(order.deliveryStatus) || order.paymentStatus === 'refunded') {
+        return res.status(400).json({ error: 'Cannot collect cash for a cancelled or refunded order.' });
+      }
+
       if (req.user.role === 'station_manager') {
         const allowed = await canStationManageOrder(req.user._id, order);
         if (!allowed) {
@@ -994,6 +999,11 @@ router.put(
 
       let order = await Order.findById(req.params.id);
       if (!order) return res.status(404).json({ error: 'Order not found' });
+
+      // Prevent collecting cash for cancelled or refunded orders
+      if (['cancelled', 'refunded'].includes(order.deliveryStatus) || order.paymentStatus === 'refunded') {
+        return res.status(400).json({ error: 'Cannot collect cash for a cancelled or refunded order.' });
+      }
 
       // ===== AGENT ASSIGNMENT CHECK =====
       if (req.user.role === 'agent') {
