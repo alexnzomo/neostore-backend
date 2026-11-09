@@ -9,6 +9,7 @@ const settlementSchema = new mongoose.Schema({
   agentEarnings: { type: Number, default: 0, min: 0 },
   stationEarnings: { type: Number, default: 0, min: 0 },
   platformCommission: { type: Number, required: true, min: 0 },
+  platformShippingMargin: { type: Number, default: 0 },   // can be negative if shipping is undercharged  
   vendorPaid: { type: Boolean, default: false },
   agentPaid: { type: Boolean, default: false },
   stationPaid: { type: Boolean, default: false },

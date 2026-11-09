@@ -79,13 +79,16 @@ async function createSettlementsForOrder(order) {
 
   const isPickup = order.deliveryInfo.type === 'pickup';
   const agentEarnings = order.assignedAgentId ? agentFee : 0;
-  const stationEarnings = isPickup ? stationFee : 0;
+  // Station gets paid for handling the package, regardless of pickup or door delivery
+  const stationEarnings = stationFee;
 
   const settlements = [];
   for (const vendorId in vendorMap) {
     const data = vendorMap[vendorId];
     const vendorEarningsKES = (data.subtotalUSD - data.totalCommissionUSD) * 130;
     const platformCommissionKES = data.totalCommissionUSD * 130;
+    // How much of the customer's shipping fee remains after paying agent and station
+    const platformShippingMargin = (order.shippingFeeKES || 0) - agentEarnings - stationEarnings;    
 
     // Idempotent upsert — safe against concurrent triggers.
     // MongoDB findOneAndUpdate with upsert can throw E11000 under concurrent calls;
@@ -104,6 +107,7 @@ async function createSettlementsForOrder(order) {
             agentEarnings: agentEarnings,
             stationEarnings: stationEarnings,
             platformCommission: platformCommissionKES,
+            platformShippingMargin: platformShippingMargin,            
             vendorPaid: false,
             agentPaid: false,
             stationPaid: false
@@ -169,8 +173,9 @@ router.get('/', protect, allowRoles('admin', 'owner', 'station_manager', 'agent'
         return res.json({ orders: [], total: 0, limit, skip });
       }
     } else if (req.user.role === 'agent') {
-      // Agents only see orders assigned to them
+      // Agents only see delivery orders assigned to them (pickup orders are not theirs)
       query.assignedAgentId = req.user._id;
+      query['deliveryInfo.type'] = 'delivery';
     
     } else if (req.user.role === 'vendor') {
       // Vendors only see orders that contain at least one of their products
@@ -660,6 +665,10 @@ router.put(
       const { agentId } = req.body;
       const order = await Order.findById(req.params.id);
       if (!order) return res.status(404).json({ error: 'Order not found' });
+      // Agents only apply to door-delivery orders. Pickup orders are handled by the station.
+      if (order.deliveryInfo.type === 'pickup') {
+        return res.status(400).json({ error: 'Agents cannot be assigned to pickup orders. Pickup orders are fulfilled at the station.' });
+      }
       order.assignedAgentId = agentId || null;
       await order.save();
 

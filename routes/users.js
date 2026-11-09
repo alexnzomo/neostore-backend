@@ -84,12 +84,12 @@ router.put(
   }
 );
 
-// Assign station to a station manager (admin/owner only) – with checks & notification
+// Assign station to a station manager OR agent (admin/owner only)
 router.put(
   '/:id/assign-station',
   protect,
   allowRoles('admin', 'owner'),
-  sanitizeBody(['stationId']), // ✅ NEW
+  sanitizeBody(['stationId']),
   [
     body('stationId').notEmpty().withMessage('Station ID required'),
     body('stationId').isMongoId().withMessage('Invalid station ID'),
@@ -104,42 +104,53 @@ router.put(
       const { stationId } = req.body;
       const user = await User.findById(req.params.id);
       if (!user) return res.status(404).json({ error: 'User not found' });
-      if (user.role !== 'station_manager') {
-        return res.status(400).json({ error: 'User is not a station manager' });
+
+      if (!['station_manager', 'agent'].includes(user.role)) {
+        return res.status(400).json({ error: 'Only station managers and agents can be assigned to a station' });
       }
 
       const station = await PickupStation.findById(stationId);
       if (!station) return res.status(404).json({ error: 'Station not found' });
 
-      // Check if the station already has a manager
-      if (station.managerId) {
-        const currentManager = await User.findById(station.managerId);
-        return res.status(400).json({
-          error: `Station already has a manager: ${currentManager?.fullName || 'Unknown user'}. Please unassign them first.`
-        });
-      }
-
-      // Check if the user already manages a station
-      if (user.stationId) {
-        const existingStation = await PickupStation.findById(user.stationId);
-        return res.status(400).json({
-          error: `User already manages station: ${existingStation?.name || 'Unknown station'}. Please unassign them first.`
-        });
+      // Station manager-specific checks (one manager per station, one station per manager)
+      if (user.role === 'station_manager') {
+        if (station.managerId) {
+          const currentManager = await User.findById(station.managerId);
+          return res.status(400).json({
+            error: `Station already has a manager: ${currentManager?.fullName || 'Unknown user'}. Please unassign them first.`
+          });
+        }
+        if (user.stationId) {
+          const existingStation = await PickupStation.findById(user.stationId);
+          return res.status(400).json({
+            error: `User already manages station: ${existingStation?.name || 'Unknown station'}. Please unassign them first.`
+          });
+        }
+        station.managerId = user._id;
+        await station.save();
+      } else {
+        // Agents: many agents per station, one station per agent
+        if (user.stationId && user.stationId.toString() !== stationId) {
+          const existingStation = await PickupStation.findById(user.stationId);
+          return res.status(400).json({
+            error: `Agent is currently assigned to ${existingStation?.name || 'another station'}. Unassign first.`
+          });
+        }
       }
 
       user.stationId = stationId;
-      station.managerId = user._id;
       await user.save();
-      await station.save();
 
-      await logAction(req, 'station_assign', user._id, { stationId });
-      // ✅ Send notification to the new station manager
+      await logAction(req, 'station_assign', user._id, { stationId, role: user.role });
+
       await createNotification(
         user._id,
         'system',
-        'Station Manager Assignment',
-        `You have been assigned as manager of "${station.name}". Please visit your station dashboard.`,
-        '/station_manager.html'
+        user.role === 'station_manager' ? 'Station Manager Assignment' : 'Station Assignment',
+        user.role === 'station_manager'
+          ? `You have been assigned as manager of "${station.name}". Please visit your station dashboard.`
+          : `You have been assigned to "${station.name}" as a delivery agent.`,
+        user.role === 'station_manager' ? '/station_manager.html' : '/agent.html'
       );
 
       res.json({ success: true, user: { id: user._id, stationId: user.stationId } });
@@ -174,6 +185,40 @@ router.delete(
       res.json({ success: true, message: 'Station manager removed' });
     } catch (err) {
       console.error('Unassign station manager error:', err);
+      res.status(500).json({ error: err.message });
+    }
+  }
+);
+
+// Unassign a user (agent) from their station (admin/owner only)
+router.delete(
+  '/:userId/unassign-user-station',
+  protect,
+  allowRoles('admin', 'owner'),
+  async (req, res) => {
+    try {
+      const user = await User.findById(req.params.userId);
+      if (!user) return res.status(404).json({ error: 'User not found' });
+
+      if (user.role === 'station_manager') {
+        return res.status(400).json({
+          error: 'Station managers must be unassigned via the station endpoint, not this one.'
+        });
+      }
+
+      if (!user.stationId) {
+        return res.status(400).json({ error: 'User is not assigned to a station' });
+      }
+
+      const previousStationId = user.stationId;
+      user.stationId = null;
+      await user.save();
+
+      await logAction(req, 'station_unassign', user._id, { stationId: previousStationId });
+
+      res.json({ success: true, message: 'User removed from station' });
+    } catch (err) {
+      console.error('Unassign user station error:', err);
       res.status(500).json({ error: err.message });
     }
   }
