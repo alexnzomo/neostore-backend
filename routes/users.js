@@ -329,6 +329,20 @@ router.delete('/:id', protect, allowRoles('owner'), async (req, res) => {
       });
     }
 
+    // Refuse if the user is a vendor with products or settlements.
+    // Deleting them would orphan product ownership and settlement display names.
+    const Product = require('../models/Product');
+    const Settlement = require('../models/Settlement');
+    const [vendorProducts, vendorSettlements] = await Promise.all([
+      Product.countDocuments({ vendorId: user._id }),
+      Settlement.countDocuments({ vendorId: user._id })
+    ]);
+    if (vendorProducts > 0 || vendorSettlements > 0) {
+      return res.status(400).json({
+        error: `User has ${vendorProducts} product(s) and ${vendorSettlements} settlement(s). Vendors with products or settlements cannot be deleted — reassign or archive their records first.`
+      });
+    }
+
     // Refuse if the user is a station manager still attached to a station.
     if (user.stationId) {
       return res.status(400).json({
