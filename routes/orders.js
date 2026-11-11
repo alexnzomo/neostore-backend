@@ -852,9 +852,20 @@ router.put(
 
       const current = order.deliveryStatus;
       const next = deliveryStatus;
+      
       if (current === next) return res.json(order);
-      if (!transitions[current]?.includes(next)) {
-        return res.status(400).json({ error: `Invalid transition from ${current} to ${next}` });
+
+      // 🔴 SUB-ORDER BYPASS: Vendors preparing their items are not bound
+      // by the master order's transition map, provided the order isn't finished.
+      if (req.user.role === 'vendor' && next === 'processing') {
+        if (['delivered', 'cancelled'].includes(current)) {
+          return res.status(400).json({ error: 'Cannot process an order that is already finished.' });
+        }
+        // Allow vendor to mark processing regardless of the master order status
+      } else {
+        if (!transitions[current]?.includes(next)) {
+          return res.status(400).json({ error: `Invalid transition from ${current} to ${next}` });
+        }
       }
       // ===== END TRANSITION VALIDATION =====
 
