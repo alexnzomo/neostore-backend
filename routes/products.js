@@ -150,7 +150,7 @@ router.post('/', protect, allowRoles('vendor', 'admin', 'owner'), [
   body('imageUrl').isURL({ protocols: ['http', 'https'], require_protocol: true }).withMessage('Invalid image URL (http/https only)'),
   body('category').trim().notEmpty().withMessage('Category is required'),
   body('brand').optional().trim().isLength({ max: 100 }).withMessage('Brand too long'), 
-  body('commissionOverride').optional().isFloat({ min: 0, max: 100 }).withMessage('Commission must be between 0 and 100'),
+  body('commissionOverride').optional({ values: 'null' }).isFloat({ min: 0, max: 100 }).withMessage('Commission must be between 0 and 100'),
 ], async (req, res) => {
   const errors = validationResult(req);
   if (!errors.isEmpty()) return res.status(400).json({ errors: errors.array() });
@@ -200,7 +200,7 @@ router.put('/:id', protect,
     body('imageUrl').optional().isURL({ protocols: ['http', 'https'], require_protocol: true }).withMessage('Invalid image URL (http/https only)'),
     body('category').optional().trim().notEmpty(),
     body('brand').optional().trim().isLength({ max: 100 }).withMessage('Brand too long'),
-    body('commissionOverride').optional().isFloat({ min: 0, max: 100 }).withMessage('Commission must be between 0 and 100'),
+    body('commissionOverride').optional({ values: 'null' }).isFloat({ min: 0, max: 100 }).withMessage('Commission must be between 0 and 100'),
     body('sponsored').optional().isBoolean(),
   ],
   async (req, res) => {

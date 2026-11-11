@@ -195,7 +195,8 @@ router.get('/', protect, allowRoles('admin', 'owner', 'station_manager', 'agent'
         const myItems = order.items.filter(it => myIdSet.has(it.productId.toString()));
         const mySubtotalUSD = myItems.reduce((s, it) => s + it.priceUSD * it.quantity, 0);
         const myVendorKES = Math.round(mySubtotalUSD * 130);
-        const paidEnough = ['fully_paid', 'cash_collected', 'deposit_paid'].includes(order.paymentStatus);
+        const isPayOnDelivery = ['cash_on_delivery', 'mpesa_on_delivery'].includes(order.paymentMethod);
+        const paidEnough = isPayOnDelivery || ['fully_paid', 'cash_collected', 'deposit_paid'].includes(order.paymentStatus);
 
         return {
           _id: order._id,
@@ -209,6 +210,7 @@ router.get('/', protect, allowRoles('admin', 'owner', 'station_manager', 'agent'
           })),
           vendorSubtotalKES: myVendorKES,
           paymentReadyToShip: paidEnough,
+          paymentMethod: order.paymentMethod,
           deliveryStatus: order.deliveryStatus
         };
       });
@@ -627,6 +629,27 @@ router.post(
       // once the payment is confirmed. Do not send here.
 
       await logAction(req, 'order_created', req.user._id, { orderId: newOrder._id, total: totalKES });
+
+      // Notify each vendor with items in this order
+      try {
+        const vendorIds = new Set();
+        for (const item of orderItems) {
+          const product = await Product.findById(item.productId).select('vendorId');
+          if (product && product.vendorId) vendorIds.add(product.vendorId.toString());
+        }
+        for (const vendorId of vendorIds) {
+          await createNotification(
+            vendorId,
+            'order_update',
+            '🛒 New Order Received',
+            `Order #${newOrder.orderId} includes your product${orderItems.length > 1 ? 's' : ''}. Open your dashboard to prepare for shipment.`,
+            '/vendor.html'
+          );
+        }
+      } catch (notifyErr) {
+        console.error('Vendor order notification failed:', notifyErr.message);
+      }
+
 
       res.status(201).json(newOrder);
     } catch (err) {
