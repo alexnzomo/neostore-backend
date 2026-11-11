@@ -359,13 +359,20 @@ router.post(
         deliveryInfo.stationCity = station.city;
       }
 
+      // ===== OPTIMIZATION: FETCH ALL PRODUCTS ONCE =====
+      const productIds = items.map(it => it.productId);
+      const allProducts = await Product.find({ _id: { $in: productIds } });
+      const productMap = {};
+      allProducts.forEach(p => { productMap[p._id.toString()] = p; });
+
       // Calculate totals
       let subtotalUSD = 0;
       let shippingFeeKES = 0;
       const orderItems = [];
 
       for (const item of items) {
-        const product = await Product.findById(item.productId);
+        // Use the map instead of a DB query
+        const product = productMap[item.productId.toString()];
         if (!product) return res.status(400).json({ error: `Product ${item.productId} not found` });
         if (product.stock < item.quantity) {
           return res.status(400).json({ error: `Insufficient stock for ${product.name}` });
@@ -375,7 +382,6 @@ router.post(
           return res.status(400).json({ error: `Product ${product.name} has an invalid price` });
         }
         subtotalUSD += effectivePrice * item.quantity;
-        //shippingFeeKES += (product.shippingFee || 100) * item.quantity;
         orderItems.push({
           productId: product._id,
           name: product.name,
@@ -384,7 +390,7 @@ router.post(
           vendorName: product.vendorName || null
         });
       }
-
+      
       const subtotalKES = subtotalUSD * 130;
 
       // Resolve discount server-side
@@ -516,14 +522,15 @@ router.post(
         // Delivery: calculate shipping per vendor and sum
         const vendorGroups = {};
 
-        // Group items by vendor
+        // Group items by vendor (USING MAP)
         for (const item of items) {
-          const product = await Product.findById(item.productId);
+          const product = productMap[item.productId.toString()]; // ✅ MAP LOOKUP
+          if (!product) continue; // Should never happen due to earlier check
           const vendorId = product.vendorId.toString();
           if (!vendorGroups[vendorId]) vendorGroups[vendorId] = [];
           vendorGroups[vendorId].push({ ...item, product });
         }
-
+        
         const regionFee = rates.delivery_region_fees?.[zone] || rates.delivery_region_fees?.default || 600;
 
         for (const vendorId in vendorGroups) {
@@ -545,7 +552,7 @@ router.post(
       // ===== END PER‑VENDOR SHIPPING =====
 
       // Recalculate total with dynamic shipping
-      totalKES = subtotalKES - (discountAmountKES || 0) + shippingFeeKES;
+      totalKES = subtotalKES - finalDiscountAmount + shippingFeeKES;
       if (totalKES < 0) totalKES = 0;
 
       let depositPaid = 0;
@@ -579,6 +586,24 @@ router.post(
       } else {
         return res.status(400).json({ error: 'Invalid payment method' });
       }
+
+      // ===== PAYMENT METHOD KILL SWITCHES =====
+      // We define the helper locally so we don't do 4 separate DB queries at the top
+      async function isMethodEnabled(key) {
+        const s = await Settings.findOne({ key });
+        return s ? s.value === 'true' : true; // Default to enabled if not set
+      }
+
+      if (['card', 'card_deposit'].includes(paymentMethod) && !(await isMethodEnabled('card_enabled'))) {
+        return res.status(400).json({ error: 'Card payments are currently disabled. Please choose another method.' });
+      }
+      if (['mpesa', 'mpesa_deposit', 'mpesa_on_delivery'].includes(paymentMethod) && !(await isMethodEnabled('mpesa_enabled'))) {
+        return res.status(400).json({ error: 'M-Pesa payments are currently disabled. Please choose another method.' });
+      }
+      if (['wallet', 'wallet_deposit'].includes(paymentMethod) && !(await isMethodEnabled('wallet_enabled'))) {
+        return res.status(400).json({ error: 'Wallet payments are currently disabled. Please choose another method.' });
+      }
+      // ===== END KILL SWITCHES =====
 
       const orderId = await Order.getNextOrderId();
       const newOrder = new Order({
@@ -652,7 +677,7 @@ router.post(
       try {
         const vendorIds = new Set();
         for (const item of orderItems) {
-          const product = await Product.findById(item.productId).select('vendorId');
+          const product = productMap[item.productId.toString()]; // ✅ MAP LOOKUP
           if (product && product.vendorId) vendorIds.add(product.vendorId.toString());
         }
         for (const vendorId of vendorIds) {
@@ -848,7 +873,13 @@ router.put(
 
         // 🔴 SUB-ORDER FIX: Update the vendor's map instead of the master status
         if (!order.vendorStatuses) order.vendorStatuses = new Map();
-        order.vendorStatuses.set(vendorIdStr, 'processing');
+        
+        // Handle both Map and plain object gracefully
+        if (typeof order.vendorStatuses.set === 'function') {
+          order.vendorStatuses.set(vendorIdStr, 'processing');
+        } else {
+          order.vendorStatuses[vendorIdStr] = 'processing';
+        }
         
         await order.save();
         
@@ -857,6 +888,24 @@ router.put(
         return res.json(order); // Exit early so we don't touch the master order status
       }
       // ===== END VENDOR SCOPE =====
+
+      // ===== KILL SWITCH CHECKS FOR MANUAL PAYMENTS =====
+      async function isManualMethodEnabled(key) {
+        const s = await Settings.findOne({ key });
+        return s ? s.value === 'true' : true;
+      }
+
+      if (manualPaymentMethod === 'cash' && !(await isManualMethodEnabled('cash_enabled'))) {
+        return res.status(403).json({ error: 'Cash payments are currently disabled.' });
+      }
+      if (manualPaymentMethod === 'manual_mpesa' && !(await isManualMethodEnabled('mpesa_enabled'))) {
+        return res.status(403).json({ error: 'Manual M-Pesa recording is currently disabled.' });
+      }
+      if (manualPaymentMethod === 'bank_transfer' && !(await isManualMethodEnabled('bank_transfer_enabled'))) {
+        return res.status(403).json({ error: 'Bank transfers are currently disabled.' });
+      }
+      // ===== END KILL SWITCH CHECKS =====
+
 
       // ===== AGENT ASSIGNMENT CHECK =====
       if (req.user.role === 'agent') {

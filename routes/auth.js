@@ -151,6 +151,13 @@ router.post(
     const { email, password } = req.body;
 
     const user = await User.findOne({ email });
+    if (!user) return res.status(401).json({ error: 'Invalid credentials' });
+
+    // 🔴 Soft-deleted users cannot log in
+    if (user.deletedAt) {
+      await logAction(req, 'login_failed', user._id, { reason: 'deleted_account' });
+      return res.status(401).json({ error: 'Invalid credentials' });
+    }
 
     if (!user) {
       await logAction(req, 'login_failed', null, { email, reason: 'user_not_found' });

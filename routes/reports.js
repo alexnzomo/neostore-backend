@@ -13,7 +13,7 @@ const router = express.Router();
  * Returns key platform metrics for admin/owner dashboard.
  * Access: admin or owner only.
  */
-router.get('/', protect, allowRoles('admin', 'owner'), async (req, res) => {
+router.get('/', protect, allowRoles('owner'), async (req, res) => {
   try {
     // 1. Total number of orders
     const totalOrders = await Order.countDocuments();

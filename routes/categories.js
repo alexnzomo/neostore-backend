@@ -64,10 +64,30 @@ router.put('/:id',
       const { name, commission } = req.body;
       const category = await Category.findById(req.params.id);
       if (!category) return res.status(404).json({ error: 'Category not found' });
-      if (name) category.name = name;
+      
+      const oldName = category.name;
+      let nameChanged = false;
+
+      if (name && name !== oldName) {
+        category.name = name;
+        nameChanged = true;
+      }
+      
       if (commission !== undefined) category.commission = commission;
       category.updatedAt = Date.now();
+      
       await category.save();
+
+      // 🔴 FIX: Cascade the rename to all products using the old name
+      if (nameChanged) {
+        const Product = require('../models/Product');
+        await Product.updateMany(
+          { category: oldName },
+          { $set: { category: name } }
+        );
+        console.log(`✅ Cascaded category rename "${oldName}" → "${name}"`);
+      }
+      
       res.json(category);
     } catch (err) {
       res.status(500).json({ error: err.message });

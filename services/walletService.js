@@ -22,12 +22,12 @@ class WalletService {
     return user ? user.walletBalance : 0;
   }
 
-  static async credit(userId, amount, description, referenceId = null, referenceType = null, metadata = {}) {
+  static async credit(userId, amount, description, referenceId = null, referenceType = null, metadata = {}, externalSession = null) {
     if (amount <= 0) throw new Error('Amount must be positive');
 
     const deterministicKey = this.buildDeterministicKey(referenceType, referenceId, 'credit');
     if (deterministicKey) {
-      const existing = await WalletTransaction.findOne({ idempotencyKey: deterministicKey });
+      const existing = await WalletTransaction.findOne({ idempotencyKey: deterministicKey }).session(externalSession);
       if (existing) {
         return {
           success: true,
@@ -39,8 +39,12 @@ class WalletService {
     }
 
     const idempotencyKey = deterministicKey || this.generateIdempotencyKey();
-    const session = await mongoose.startSession();
-    session.startTransaction();
+    
+    // Use external session if provided, otherwise create a new one
+    const session = externalSession || await mongoose.startSession();
+    const shouldCommit = !externalSession;
+    
+    if (shouldCommit) session.startTransaction();
 
     try {
       const user = await User.findById(userId).session(session);
@@ -65,22 +69,26 @@ class WalletService {
       });
       await transaction.save({ session });
 
-      await session.commitTransaction();
-      session.endSession();
+      if (shouldCommit) {
+        await session.commitTransaction();
+        session.endSession();
+      }
       return { success: true, newBalance, transaction };
     } catch (error) {
-      await session.abortTransaction();
-      session.endSession();
+      if (shouldCommit) {
+        await session.abortTransaction();
+        session.endSession();
+      }
       throw error;
     }
   }
 
-  static async debit(userId, amount, description, referenceId = null, referenceType = null, metadata = {}) {
+  static async debit(userId, amount, description, referenceId = null, referenceType = null, metadata = {}, externalSession = null) {
     if (amount <= 0) throw new Error('Amount must be positive');
 
     const deterministicKey = this.buildDeterministicKey(referenceType, referenceId, 'debit');
     if (deterministicKey) {
-      const existing = await WalletTransaction.findOne({ idempotencyKey: deterministicKey });
+      const existing = await WalletTransaction.findOne({ idempotencyKey: deterministicKey }).session(externalSession);
       if (existing) {
         return {
           success: true,
@@ -92,8 +100,12 @@ class WalletService {
     }
 
     const idempotencyKey = deterministicKey || this.generateIdempotencyKey();
-    const session = await mongoose.startSession();
-    session.startTransaction();
+    
+    // Use external session if provided, otherwise create a new one
+    const session = externalSession || await mongoose.startSession();
+    const shouldCommit = !externalSession;
+    
+    if (shouldCommit) session.startTransaction();
 
     try {
       const user = await User.findById(userId).session(session);
@@ -119,16 +131,20 @@ class WalletService {
       });
       await transaction.save({ session });
 
-      await session.commitTransaction();
-      session.endSession();
+      if (shouldCommit) {
+        await session.commitTransaction();
+        session.endSession();
+      }
       return { success: true, newBalance, transaction };
     } catch (error) {
-      await session.abortTransaction();
-      session.endSession();
+      if (shouldCommit) {
+        await session.abortTransaction();
+        session.endSession();
+      }
       throw error;
     }
   }
-
+  
   static async transfer(senderId, receiverId, amount, description, metadata = {}) {
     if (amount <= 0) throw new Error('Amount must be positive');
     if (senderId.toString() === receiverId.toString()) throw new Error('Cannot transfer to yourself');

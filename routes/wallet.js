@@ -216,27 +216,46 @@ router.post('/topup/initiate', protect, [
       if (!phoneNumber) {
         return res.status(400).json({ error: 'Phone number required for M‑Pesa' });
       }
-      const mpesaResponse = await initiateMpesaPayment(
-        phoneNumber,
+
+      // 🔴 FIX: Save to DB BEFORE calling Safaricom
+      const topUp = new TopUpRequest({
+        userId,
         amount,
-        `TOPUP-${userId.toString().slice(-6)}`
-      );
-      if (mpesaResponse.ResponseCode === '0') {
-        const topUp = new TopUpRequest({
-          userId,
+        merchantRequestId: `PENDING_${Date.now()}_${Math.random().toString(36).slice(2)}`, // Temporary ID
+        status: 'pending'
+      });
+      await topUp.save();
+
+      try {
+        const mpesaResponse = await initiateMpesaPayment(
+          phoneNumber,
           amount,
-          merchantRequestId: mpesaResponse.MerchantRequestID,
-          checkoutRequestId: mpesaResponse.CheckoutRequestID,
-          status: 'pending'
-        });
-        await topUp.save();
-        return res.json({
-          success: true,
-          merchantRequestId: mpesaResponse.MerchantRequestID,
-          message: 'STK push sent. Complete payment on your phone.'
-        });
-      } else {
-        return res.status(400).json({ error: 'Failed to initiate M‑Pesa payment' });
+          `TOPUP-${userId.toString().slice(-6)}`
+        );
+
+        if (mpesaResponse.ResponseCode === '0') {
+          // Update the record with the real Safaricom IDs
+          await TopUpRequest.updateOne(
+            { _id: topUp._id },
+            {
+              merchantRequestId: mpesaResponse.MerchantRequestID,
+              checkoutRequestId: mpesaResponse.CheckoutRequestID
+            }
+          );
+          return res.json({
+            success: true,
+            merchantRequestId: mpesaResponse.MerchantRequestID,
+            message: 'STK push sent. Complete payment on your phone.'
+          });
+        } else {
+          // Safaricom rejected it, mark as failed
+          await TopUpRequest.updateOne({ _id: topUp._id }, { status: 'failed' });
+          return res.status(400).json({ error: 'Failed to initiate M‑Pesa payment' });
+        }
+      } catch (mpesaErr) {
+        // Network error with Safaricom, mark as failed
+        await TopUpRequest.updateOne({ _id: topUp._id }, { status: 'failed' });
+        throw mpesaErr;
       }
     }
 
@@ -312,44 +331,62 @@ router.post('/pay', protect, requireKYC, verifyTempToken, [
       });
     }
 
-    // Debit wallet first
-    const result = await WalletService.debit(
-      userId,
-      expectedAmount,
-      `Payment for order #${order.orderId}`,
-      order._id.toString(),
-      'order'
-    );
+    const mongoose = require('mongoose'); // Ensure this is imported at the top of the file
+    const session = await mongoose.startSession();
+    session.startTransaction();
 
-    // Atomically mark the order as paid. If the order changed state
-    // between our read and this write, refund and abort.
-    const claimed = await Order.findOneAndUpdate(
-      { _id: order._id, paymentStatus: currentStatus },
-      {
-        $set: {
-          paymentStatus: newStatus,
-          depositPaid: newDepositPaid,
-          balanceDue: newRemaining,
-          remainingBalance: newRemaining,
-          updatedAt: Date.now()
-        }
-      },
-      { new: true }
-    );
+    let result;
+    let claimed;
 
-    if (!claimed) {
-      // Order was modified by another request; give the money back.
-      await WalletService.credit(
+    try {
+      // 1. Debit wallet (within the session)
+      result = await WalletService.debit(
         userId,
         expectedAmount,
-        `Refund: order #${order.orderId} was already processed`,
+        `Payment for order #${order.orderId}`,
         order._id.toString(),
-        'refund'
+        'order',
+        {},
+        session // Pass session to WalletService
       );
-      return res.status(409).json({ error: 'Order was already processed. Wallet refunded.' });
+
+      // 2. Atomically mark the order as paid (within the session)
+      claimed = await Order.findOneAndUpdate(
+        { _id: order._id, paymentStatus: currentStatus },
+        {
+          $set: {
+            paymentStatus: newStatus,
+            depositPaid: newDepositPaid,
+            balanceDue: newRemaining,
+            remainingBalance: newRemaining,
+            updatedAt: Date.now()
+          }
+        },
+        { new: true, session }
+      );
+
+      if (!claimed) {
+        // Order state changed in parallel; throw to trigger rollback
+        throw new Error('ORDER_STATE_CHANGED');
+      }
+
+      // Commit the transaction
+      await session.commitTransaction();
+    } catch (err) {
+      // Rollback everything if anything failed
+      await session.abortTransaction();
+      
+      if (err.message === 'ORDER_STATE_CHANGED') {
+        return res.status(409).json({ error: 'Order was already processed or state changed. Wallet was not debited.' });
+      }
+      
+      console.error('Wallet pay error:', err);
+      return res.status(400).json({ error: err.message });
+    } finally {
+      session.endSession();
     }
 
-    // Post-payment side effects (best effort — do not fail the request if these throw)
+    // ✅ Post-payment side effects (Run OUTSIDE the session so they don't block/rollback money)
     try { await sendOrderConfirmationEmail(claimed); } catch (e) {
       console.error('Order confirmation email failed:', e.message);
     }
@@ -552,27 +589,52 @@ router.post('/pin/verify', protect, [
   try {
     const { pin } = req.body;
     const userId = req.user._id;
+    const now = new Date();
 
-    const pinRecord = await WalletPIN.findOne({ userId });
-    if (!pinRecord) return res.status(404).json({ error: 'PIN not set. Please set a PIN first.' });
+    // 1. Atomic check & increment. 
+    // This ensures parallel requests don't bypass the lockout.
+    const pinRecord = await WalletPIN.findOneAndUpdate(
+      { 
+        userId,
+        $or: [{ lockedUntil: null }, { lockedUntil: { $lte: now } }]
+      },
+      { 
+        $inc: { failedAttempts: 1 } 
+      },
+      { new: true }
+    );
 
-    if (pinRecord.lockedUntil && pinRecord.lockedUntil > new Date()) {
-      return res.status(403).json({ error: 'PIN locked. Try again later.' });
-    }
-
-    const isValid = await pinRecord.comparePIN(pin);
-    if (!isValid) {
-      pinRecord.failedAttempts += 1;
-      if (pinRecord.failedAttempts >= 5) {
-        pinRecord.lockedUntil = new Date(Date.now() + 15 * 60 * 1000);
+    // If no record found, it's either not set, or currently locked
+    if (!pinRecord) {
+      const existing = await WalletPIN.findOne({ userId });
+      if (!existing) return res.status(404).json({ error: 'PIN not set. Please set a PIN first.' });
+      if (existing.lockedUntil && existing.lockedUntil > now) {
+        return res.status(403).json({ error: 'PIN locked. Try again later.' });
       }
-      await pinRecord.save();
       return res.status(400).json({ error: 'Invalid PIN' });
     }
 
-    pinRecord.failedAttempts = 0;
-    pinRecord.lockedUntil = null;
-    await pinRecord.save();
+    // 2. Check if we hit the limit
+    if (pinRecord.failedAttempts > 5) {
+      await WalletPIN.updateOne(
+        { userId },
+        { $set: { lockedUntil: new Date(Date.now() + 15 * 60 * 1000) } }
+      );
+      return res.status(400).json({ error: 'Too many failed attempts. PIN locked for 15 minutes.' });
+    }
+
+    // 3. Verify the PIN
+    const isValid = await pinRecord.comparePIN(pin);
+    
+    if (!isValid) {
+      return res.status(400).json({ error: 'Invalid PIN' });
+    }
+
+    // 4. Success — reset the counter
+    await WalletPIN.updateOne(
+      { userId },
+      { $set: { failedAttempts: 0, lockedUntil: null } }
+    );
 
     const tempToken = jwt.sign(
       { userId: userId.toString(), purpose: 'wallet-operation' },
@@ -613,45 +675,58 @@ router.post('/reverse-transaction', protect, allowRoles('owner'), [
 
   try {
     const { transactionId, reason } = req.body;
-    const transaction = await WalletTransaction.findById(transactionId);
-    if (!transaction) return res.status(404).json({ error: 'Transaction not found' });
 
-    if (transaction.status === 'reversed') {
+    // 🔴 FIX: Atomically claim the transaction.
+    // Only the first request gets the document. Any concurrent requests will get null.
+    const claimed = await WalletTransaction.findOneAndUpdate(
+      { _id: transactionId, status: { $ne: 'reversed' } },
+      { $set: { status: 'reversed' } },
+      { new: true }
+    );
+
+    if (!claimed) {
+      const existing = await WalletTransaction.findById(transactionId);
+      if (!existing) return res.status(404).json({ error: 'Transaction not found' });
       return res.status(400).json({ error: 'Transaction already reversed' });
     }
 
-    const isCredit = transaction.type === 'credit' || transaction.type === 'transfer_in';
-    const isDebit = transaction.type === 'debit' || transaction.type === 'transfer_out';
+    const isCredit = claimed.type === 'credit' || claimed.type === 'transfer_in';
+    const isDebit = claimed.type === 'debit' || claimed.type === 'transfer_out';
 
     let newBalance;
-    if (isCredit) {
-      const result = await WalletService.debit(
-        transaction.userId,
-        transaction.amount,
-        `Reversal of ${transaction.description} (${reason})`,
-        transaction._id,
-        'refund'
-      );
-      newBalance = result.newBalance;
-    } else if (isDebit) {
-      const result = await WalletService.credit(
-        transaction.userId,
-        transaction.amount,
-        `Reversal of ${transaction.description} (${reason})`,
-        transaction._id,
-        'refund'
-      );
-      newBalance = result.newBalance;
-    } else {
-      return res.status(400).json({ error: 'Cannot reverse this transaction type' });
+    try {
+      if (isCredit) {
+        const result = await WalletService.debit(
+          claimed.userId,
+          claimed.amount,
+          `Reversal of ${claimed.description} (${reason})`,
+          claimed._id,
+          'refund'
+        );
+        newBalance = result.newBalance;
+      } else if (isDebit) {
+        const result = await WalletService.credit(
+          claimed.userId,
+          claimed.amount,
+          `Reversal of ${claimed.description} (${reason})`,
+          claimed._id,
+          'refund'
+        );
+        newBalance = result.newBalance;
+      } else {
+        // Rollback the claim if it's an invalid type
+        await WalletTransaction.updateOne({ _id: claimed._id }, { $set: { status: 'completed' } });
+        return res.status(400).json({ error: 'Cannot reverse this transaction type' });
+      }
+    } catch (walletErr) {
+      // Rollback the claim if the wallet operation fails (e.g. insufficient balance)
+      await WalletTransaction.updateOne({ _id: claimed._id }, { $set: { status: 'completed' } });
+      throw walletErr;
     }
 
-    transaction.status = 'reversed';
-    await transaction.save();
-
-    await logAction(req, 'reverse_transaction', transaction.userId, {
-      originalTransactionId: transaction._id,
-      amount: transaction.amount,
+    await logAction(req, 'reverse_transaction', claimed.userId, {
+      originalTransactionId: claimed._id,
+      amount: claimed.amount,
       reason,
       newBalance
     });
@@ -660,7 +735,7 @@ router.post('/reverse-transaction', protect, allowRoles('owner'), [
       success: true,
       message: 'Transaction reversed successfully',
       newBalance,
-      reversedTransaction: transaction
+      reversedTransaction: claimed
     });
   } catch (err) {
     console.error('Reversal error:', err);

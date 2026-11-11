@@ -17,6 +17,12 @@ exports.protect = async (req, res, next) => {
     if (user.isSuspended) {
       return res.status(403).json({ error: 'Account suspended' });
     }
+
+    // 🔴 Block soft-deleted users from all authenticated requests
+    if (user.deletedAt) {
+      return res.status(401).json({ error: 'Not authorized, no token' });
+    }
+
     req.user = user;
     next();
   } catch (err) {

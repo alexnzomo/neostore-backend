@@ -16,12 +16,17 @@ router.get('/', protect, allowRoles('admin', 'owner'), async (req, res) => {
   try {
     const limit = Math.min(parseInt(req.query.limit) || 50, 200);
     const skip = parseInt(req.query.skip) || 0;
-    
+
+    // 🔴 Owner-only fields hidden from non-owners
+    const projection = req.user.role === 'owner'
+      ? '-password'
+      : '-password -walletBalance -referralCode -canApproveWithdrawals';
+
     const [users, total] = await Promise.all([
-      User.find().select('-password').skip(skip).limit(limit),
+      User.find().select(projection).skip(skip).limit(limit),
       User.countDocuments()
     ]);
-    
+
     res.json({ users, total, limit, skip });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -33,6 +38,12 @@ router.get('/:id', protect, allowRoles('admin', 'owner'), async (req, res) => {
   try {
     const user = await User.findById(req.params.id).select('-password');
     if (!user) return res.status(404).json({ error: 'User not found' });
+
+    // Non-owners cannot see soft-deleted users
+    if (user.deletedAt && req.user.role !== 'owner') {
+      return res.status(404).json({ error: 'User not found' });
+    }
+
     res.json(user);
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -314,10 +325,9 @@ router.delete('/:id', protect, allowRoles('owner'), async (req, res) => {
     const user = await User.findById(req.params.id);
     if (!user) return res.status(404).json({ error: 'User not found' });
     if (user.role === 'owner') return res.status(403).json({ error: 'Cannot delete the platform principal' });
+    if (user.deletedAt) return res.status(400).json({ error: 'User already deleted' });
 
-    // Refuse if the user has active orders (as customer or agent).
-    // Otherwise orders keep a dangling customerId / assignedAgentId,
-    // which shows as blank names on the admin dashboard and undercounts reports.
+    // Refuse if there are active orders — must be resolved first
     const Order = require('../models/Order');
     const activeOrders = await Order.countDocuments({
       $or: [{ customerId: user._id }, { assignedAgentId: user._id }],
@@ -329,34 +339,110 @@ router.delete('/:id', protect, allowRoles('owner'), async (req, res) => {
       });
     }
 
-    // Refuse if the user is a vendor with products or settlements.
-    // Deleting them would orphan product ownership and settlement display names.
-    const Product = require('../models/Product');
-    const Settlement = require('../models/Settlement');
-    const [vendorProducts, vendorSettlements] = await Promise.all([
-      Product.countDocuments({ vendorId: user._id }),
-      Settlement.countDocuments({ vendorId: user._id })
-    ]);
-    if (vendorProducts > 0 || vendorSettlements > 0) {
-      return res.status(400).json({
-        error: `User has ${vendorProducts} product(s) and ${vendorSettlements} settlement(s). Vendors with products or settlements cannot be deleted — reassign or archive their records first.`
-      });
-    }
-
-    // Refuse if the user is a station manager still attached to a station.
+    // Refuse if the user is a station manager still attached to a station
     if (user.stationId) {
       return res.status(400).json({
         error: 'User is a station manager. Unassign them from their station first.'
       });
     }
 
+    // If they have financial history (products or settlements), soft delete
+    const Product = require('../models/Product');
+    const Settlement = require('../models/Settlement');
+    const [activeProducts, vendorSettlements] = await Promise.all([
+      Product.countDocuments({ vendorId: user._id, isDeleted: { $ne: true } }),
+      Settlement.countDocuments({ vendorId: user._id })
+    ]);
+
+    if (activeProducts > 0 || vendorSettlements > 0) {
+      // 🔴 SOFT DELETE: preserve financial history
+      await User.softDelete(user._id, req.user._id, `Admin deletion via API (had ${activeProducts} products, ${vendorSettlements} settlements)`);
+      await logAction(req, 'soft_delete_user', user._id, {
+        deletedEmail: user.email,
+        activeProducts,
+        vendorSettlements
+      });
+      return res.json({
+        message: 'User soft-deleted. Financial history preserved. The user cannot log in.',
+        softDeleted: true
+      });
+    }
+
+    // No financial history — safe to hard delete
+    const deletedEmail = user.email;
     await user.deleteOne();
-    await logAction(req, 'delete_user', user._id, { deletedUser: user.email });
-    res.json({ message: 'User deleted' });
+    await logAction(req, 'delete_user', user._id, { deletedUser: deletedEmail });
+    res.json({ message: 'User deleted permanently.' });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
+
+// Reactivate a soft-deleted user (owner only)
+router.post(
+  '/:id/reactivate',
+  protect,
+  allowRoles('owner'),
+  [
+    body('email')
+      .isEmail()
+      .withMessage('Valid email required')
+      .normalizeEmail(),
+    body('fullName')
+      .trim()
+      .notEmpty()
+      .withMessage('Full name required')
+      .isLength({ max: 100 })
+      .withMessage('Full name too long'),
+  ],
+  async (req, res) => {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) return res.status(400).json({ errors: errors.array() });
+
+    try {
+      const user = await User.findById(req.params.id);
+      if (!user) return res.status(404).json({ error: 'User not found' });
+      if (!user.deletedAt) return res.status(400).json({ error: 'User is not deleted' });
+
+      const { email, fullName } = req.body;
+      const normalizedEmail = email.trim().toLowerCase();
+
+      // Check email is not taken by ANOTHER user
+      const existing = await User.findOne({
+        email: normalizedEmail,
+        _id: { $ne: user._id }
+      });
+      if (existing) {
+        return res.status(400).json({ error: 'Email already in use by another account' });
+      }
+
+      // Restore fields
+      user.deletedAt = null;
+      user.deletedBy = null;
+      user.deleteReason = null;
+      user.isSuspended = false;
+      user.email = normalizedEmail;
+      user.fullName = fullName.trim();
+      // walletBalance, phone, referralCode, canApproveWithdrawals remain at their soft-delete values (0, null, null, false)
+      // The owner must manually re-enable those if needed
+
+      await user.save();
+
+      await logAction(req, 'reactivate_user', user._id, {
+        restoredEmail: normalizedEmail,
+        restoredFullName: fullName.trim()
+      });
+
+      res.json({
+        success: true,
+        message: 'User reactivated. Wallet balance, phone, and referral code remain zeroed. Please update those fields manually if needed.',
+        userId: user._id
+      });
+    } catch (err) {
+      res.status(500).json({ error: err.message });
+    }
+  }
+);
 
 // Reset password — verifies OTP in the SAME request
 router.post('/reset-password', async (req, res) => {

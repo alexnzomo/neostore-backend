@@ -85,13 +85,11 @@ router.put('/:id/paid', protect, allowRoles('admin', 'owner'), async (req, res) 
       userId = settlement.vendorId;
       amount = settlement.vendorEarnings;
       description = `Earnings from order #${settlement.orderId}`;
-      settlement.vendorPaid = true;
     } else if (type === 'agent') {
       if (settlement.agentPaid) return res.status(400).json({ error: 'Agent already paid' });
       userId = settlement.agentId;
       amount = settlement.agentEarnings;
       description = `Delivery earnings from order #${settlement.orderId}`;
-      settlement.agentPaid = true;
     } else if (type === 'station') {
       if (settlement.stationPaid) return res.status(400).json({ error: 'Station already paid' });
       const station = await PickupStation.findById(settlement.stationId);
@@ -100,7 +98,6 @@ router.put('/:id/paid', protect, allowRoles('admin', 'owner'), async (req, res) 
       userId = station.managerId;
       amount = settlement.stationEarnings;
       description = `Pickup station earnings from order #${settlement.orderId}`;
-      settlement.stationPaid = true;
     } else {
       return res.status(400).json({ error: 'Invalid type' });
     }
@@ -115,25 +112,62 @@ router.put('/:id/paid', protect, allowRoles('admin', 'owner'), async (req, res) 
       });
     }
 
-    // Credit wallet
-    const result = await WalletService.credit(
-      userId,
-      amount,
-      description,
-      settlement._id,
-      'settlement'
-    );
+    // 🔴 SOFT DELETE CHECK: Cannot pay a soft-deleted user
+    const recipient = await User.findById(userId).select('deletedAt fullName');
+    if (!recipient) {
+      return res.status(404).json({ error: 'Recipient not found' });
+    }
+    if (recipient.deletedAt) {
+      return res.status(400).json({
+        error: `Cannot process payout: this user's account has been deleted (${recipient.fullName}). If this payout is legitimate, reactivate the account first, or handle the payment manually outside the platform.`
+      });
+    }
 
-    await logAction(req, 'settlement_payout', userId, { amount, type, settlementId: settlement._id });
+    // 🔴 FIX: Idempotency check to prevent double payout on crash
+    const idempotencyKey = `settlement:${settlement._id}:${type}:credit`;
+    const existingTx = await WalletTransaction.findOne({ idempotencyKey });
 
-    // ✅ Create notification
-    await createNotification(
-      userId,
-      'settlement',
-      'Payout received',
-      `You received KES ${amount} from settlement for order #${settlement.orderId}`,
-      '/account.html'
-    );
+    let result;
+    let alreadyPaid = false;
+
+    if (existingTx) {
+      alreadyPaid = true;
+      result = {
+        transaction: existingTx,
+        newBalance: existingTx.balanceAfter
+      };
+      console.log(`⚠️ Reconciling already-processed payout for settlement ${settlement._id}`);
+    } else {
+      result = await WalletService.credit(
+        userId,
+        amount,
+        description,
+        settlement._id,
+        'settlement'
+      );
+    }
+
+    // Mark as paid (idempotently)
+    if (type === 'vendor') settlement.vendorPaid = true;
+    if (type === 'agent') settlement.agentPaid = true;
+    if (type === 'station') settlement.stationPaid = true;
+
+    await logAction(req, 'settlement_payout', userId, { 
+      amount, 
+      type, 
+      settlementId: settlement._id, 
+      reconciled: alreadyPaid 
+    });
+
+    if (!alreadyPaid) {
+      await createNotification(
+        userId,
+        'settlement',
+        'Payout received',
+        `You received KES ${amount} from settlement for order #${settlement.orderId}`,
+        '/account.html'
+      );
+    }
 
     // If all parties paid, set paidAt
     if (settlement.vendorPaid && settlement.agentPaid && settlement.stationPaid) {
@@ -146,7 +180,8 @@ router.put('/:id/paid', protect, allowRoles('admin', 'owner'), async (req, res) 
       success: true,
       settlement,
       walletTransaction: result.transaction,
-      newBalance: result.newBalance
+      newBalance: result.newBalance,
+      reconciled: alreadyPaid
     });
   } catch (err) {
     console.error(err);

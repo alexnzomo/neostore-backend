@@ -254,6 +254,41 @@ router.put('/cash-max-per-agent-per-day', protect, allowRoles('owner'), async (r
   res.json({ success: true, value });
 });
 
+// ========== Payment Method Kill Switches ==========
+
+// Helper to get a payment method status (defaults to true)
+async function getPaymentStatus(key) {
+  const setting = await Settings.findOne({ key });
+  return setting ? setting.value === 'true' : true;
+}
+
+router.get('/payments/:method', async (req, res) => {
+  const validMethods = ['card_enabled', 'mpesa_enabled', 'wallet_enabled', 'manual_mpesa_enabled', 'bank_transfer_enabled'];
+  if (!validMethods.includes(req.params.method)) {
+    return res.status(400).json({ error: 'Invalid method' });
+  }
+  const enabled = await getPaymentStatus(req.params.method);
+  res.json({ enabled });
+});
+
+router.put('/payments/:method', protect, allowRoles('owner'), async (req, res) => {
+  const validMethods = ['card_enabled', 'mpesa_enabled', 'wallet_enabled', 'manual_mpesa_enabled', 'bank_transfer_enabled'];
+  if (!validMethods.includes(req.params.method)) {
+    return res.status(400).json({ error: 'Invalid method' });
+  }
+  const { enabled } = req.body;
+  if (typeof enabled !== 'boolean') {
+    return res.status(400).json({ error: 'enabled must be a boolean' });
+  }
+  
+  await Settings.findOneAndUpdate(
+    { key: req.params.method },
+    { key: req.params.method, value: enabled ? 'true' : 'false' },
+    { upsert: true, new: true }
+  );
+  res.json({ success: true, enabled });
+});
+
 // Get/set KYC threshold for orders (0 = no threshold)
 router.get('/kyc-order-threshold', async (req, res) => {
   const setting = await Settings.findOne({ key: 'kyc_order_threshold' });
