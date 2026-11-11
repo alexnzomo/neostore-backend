@@ -189,14 +189,32 @@ router.get('/', protect, allowRoles('admin', 'owner', 'station_manager', 'agent'
     ]);
 
     // Vendor projection: only their items and only the fields they need
-    if (req.user.role === 'vendor' && vendorProductIds) {
-      const myIdSet = new Set(vendorProductIds.map(id => id.toString()));
+    if (req.user.role === 'vendor') {
+      const vendorIdStr = req.user._id.toString();
+      const myIdSet = new Set((vendorProductIds || []).map(id => id.toString()));
+      
       const projected = orders.map(order => {
-        const myItems = order.items.filter(it => myIdSet.has(it.productId.toString()));
+        // 1. Get vendor's independent status from the map (defaults to 'pending')
+        let myStatus = 'pending';
+        if (order.vendorStatuses) {
+          myStatus = order.vendorStatuses.get(vendorIdStr) || 'pending';
+        }
+
+        // 2. Filter items (using ID match, fallback to vendorName if product was deleted/recreated)
+        let myItems = order.items.filter(it => myIdSet.has(it.productId.toString()));
+        if (myItems.length === 0) {
+          myItems = order.items.filter(it => it.vendorName === req.user.fullName);
+        }
+
         const mySubtotalUSD = myItems.reduce((s, it) => s + it.priceUSD * it.quantity, 0);
         const myVendorKES = Math.round(mySubtotalUSD * 130);
+
+        // 3. Calculate if it's ready to ship based on payment and the vendor's own status
         const isPayOnDelivery = ['cash_on_delivery', 'mpesa_on_delivery'].includes(order.paymentMethod);
-        const paidEnough = isPayOnDelivery || ['fully_paid', 'cash_collected', 'deposit_paid'].includes(order.paymentStatus);
+        const isPaidOnline = ['fully_paid', 'cash_collected', 'deposit_paid'].includes(order.paymentStatus);
+        const isNotFinished = !['delivered', 'cancelled'].includes(myStatus);
+        
+        const paidEnough = isNotFinished && (isPayOnDelivery || isPaidOnline);
 
         return {
           _id: order._id,
@@ -211,7 +229,7 @@ router.get('/', protect, allowRoles('admin', 'owner', 'station_manager', 'agent'
           vendorSubtotalKES: myVendorKES,
           paymentReadyToShip: paidEnough,
           paymentMethod: order.paymentMethod,
-          deliveryStatus: order.deliveryStatus
+          deliveryStatus: myStatus // Send the vendor's specific status!
         };
       });
       return res.json({ orders: projected, total, limit, skip });
@@ -812,15 +830,31 @@ router.put(
 
       // ===== VENDOR SCOPE + RESTRICTION =====
       if (req.user.role === 'vendor') {
-        const myProductIds = await Product.find({ vendorId: req.user._id }).distinct('_id');
-        const myIdSet = new Set(myProductIds.map(id => id.toString()));
-        const hasMyProduct = order.items.some(it => myIdSet.has(it.productId.toString()));
+        const vendorIdStr = req.user._id.toString();
+        const myIdSet = new Set((await Product.find({ vendorId: req.user._id }).distinct('_id')).map(id => id.toString()));
+        
+        let hasMyProduct = order.items.some(it => myIdSet.has(it.productId.toString()));
+        if (!hasMyProduct) {
+          hasMyProduct = order.items.some(it => it.vendorName === req.user.fullName);
+        }
+        
         if (!hasMyProduct) {
           return res.status(403).json({ error: 'Order does not contain your products' });
         }
+        
         if (deliveryStatus !== 'processing') {
           return res.status(403).json({ error: 'Vendors can only mark orders as processing' });
         }
+
+        // 🔴 SUB-ORDER FIX: Update the vendor's map instead of the master status
+        if (!order.vendorStatuses) order.vendorStatuses = new Map();
+        order.vendorStatuses.set(vendorIdStr, 'processing');
+        
+        await order.save();
+        
+        await logAction(req, 'vendor_mark_processing', order.customerId, { orderId: order._id, vendorId: vendorIdStr });
+        
+        return res.json(order); // Exit early so we don't touch the master order status
       }
       // ===== END VENDOR SCOPE =====
 

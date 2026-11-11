@@ -64,6 +64,12 @@ const orderSchema = new mongoose.Schema({
   totalKES: { type: Number, required: true, min: 0 },
   paymentStatus: { type: String, enum: ['pending', 'deposit_paid', 'fully_paid', 'cash_collected', 'payment_failed', 'refunded'], default: 'pending' },
   deliveryStatus: { type: String, enum: ['pending', 'processing', 'shipped', 'out_for_delivery', 'ready_for_pickup', 'delivered', 'cancelled'], default: 'pending' },
+  // Tracks individual vendor statuses for split orders
+  vendorStatuses: {
+    type: Map,
+    of: String,
+    default: {}
+  },  
   paymentMethod: { 
     type: String, 
     enum: ['card', 'mpesa', 'cash_on_delivery', 'card_deposit', 'mpesa_deposit', 'wallet', 'wallet_deposit', 'mpesa_on_delivery'],
