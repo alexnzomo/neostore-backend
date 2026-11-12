@@ -339,6 +339,7 @@ const csrfExcludedPaths = [
   '/api/verify-code',
   '/api/send-reset-code',
   '/api/verify-reset-code',
+  '/api/users/reset-password',  
 ];
 app.use((req, res, next) => {
   const normalizedPath = req.path.replace(/\/+$/, '') || '/';
