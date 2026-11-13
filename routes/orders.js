@@ -889,23 +889,6 @@ router.put(
       }
       // ===== END VENDOR SCOPE =====
 
-      // ===== KILL SWITCH CHECKS FOR MANUAL PAYMENTS =====
-      async function isManualMethodEnabled(key) {
-        const s = await Settings.findOne({ key });
-        return s ? s.value === 'true' : true;
-      }
-
-      if (manualPaymentMethod === 'cash' && !(await isManualMethodEnabled('cash_enabled'))) {
-        return res.status(403).json({ error: 'Cash payments are currently disabled.' });
-      }
-      if (manualPaymentMethod === 'manual_mpesa' && !(await isManualMethodEnabled('mpesa_enabled'))) {
-        return res.status(403).json({ error: 'Manual M-Pesa recording is currently disabled.' });
-      }
-      if (manualPaymentMethod === 'bank_transfer' && !(await isManualMethodEnabled('bank_transfer_enabled'))) {
-        return res.status(403).json({ error: 'Bank transfers are currently disabled.' });
-      }
-      // ===== END KILL SWITCH CHECKS =====
-
 
       // ===== AGENT ASSIGNMENT CHECK =====
       if (req.user.role === 'agent') {
@@ -1130,6 +1113,24 @@ router.put(
       if (['cancelled', 'refunded'].includes(order.deliveryStatus) || order.paymentStatus === 'refunded') {
         return res.status(400).json({ error: 'Cannot collect cash for a cancelled or refunded order.' });
       }
+
+      // ===== KILL SWITCH CHECKS FOR MANUAL PAYMENTS =====
+      async function isManualMethodEnabled(key) {
+        const s = await Settings.findOne({ key });
+        return s ? s.value === 'true' : true;
+      }
+
+      if (manualPaymentMethod === 'cash' && !(await isManualMethodEnabled('cash_enabled'))) {
+        return res.status(403).json({ error: 'Cash payments are currently disabled.' });
+      }
+      if (manualPaymentMethod === 'manual_mpesa' && !(await isManualMethodEnabled('mpesa_enabled'))) {
+        return res.status(403).json({ error: 'Manual M-Pesa recording is currently disabled.' });
+      }
+      if (manualPaymentMethod === 'bank_transfer' && !(await isManualMethodEnabled('bank_transfer_enabled'))) {
+        return res.status(403).json({ error: 'Bank transfers are currently disabled.' });
+      }
+      // ===== END KILL SWITCH CHECKS =====
+
 
       // ===== AGENT ASSIGNMENT CHECK =====
       if (req.user.role === 'agent') {
