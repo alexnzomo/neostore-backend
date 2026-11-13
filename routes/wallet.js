@@ -195,6 +195,19 @@ router.post('/topup/initiate', protect, [
       });
     }
 
+    // 🔴 KILL SWITCH: Block Stripe top-ups when Card is disabled
+    if (method === 'stripe') {
+      const Settings = require('../models/Settings');
+      const cardEnabledSetting = await Settings.findOne({ key: 'card_enabled' });
+      const cardEnabled = cardEnabledSetting ? cardEnabledSetting.value === 'true' : true;
+      
+      if (!cardEnabled) {
+        return res.status(400).json({
+          error: 'Card top-up is currently disabled. Please use M-Pesa to top up your wallet.'
+        });
+      }
+    }
+
     if (method === 'stripe') {
       const paymentIntent = await stripe.paymentIntents.create({
         amount: Math.round(amount * 100), // cents
