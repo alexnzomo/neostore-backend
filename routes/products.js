@@ -138,7 +138,7 @@ router.post('/', protect, allowRoles('vendor', 'admin', 'owner'), [
   body('name').trim().notEmpty().withMessage('Name is required'),
   body('description').trim().notEmpty().withMessage('Description is required'),
   body('price').isFloat({ min: 0 }).withMessage('Price must be a positive number'),
-  body('salePrice').optional().isFloat({ min: 0 }).withMessage('Sale price must be positive')
+  body('salePrice').optional({ values: 'null' }).isFloat({ min: 0 }).withMessage('Sale price must be positive')
     .custom((value, { req }) => {
       if (value !== undefined && value >= req.body.price) {
         throw new Error('Sale price must be less than regular price');
@@ -188,7 +188,7 @@ router.put('/:id', protect,
     body('name').optional().trim().notEmpty(),
     body('description').optional().trim().notEmpty(),
     body('price').optional().isFloat({ min: 0 }).withMessage('Price must be positive'),
-    body('salePrice').optional().isFloat({ min: 0 }).withMessage('Sale price must be positive')
+    body('salePrice').optional({ values: 'null' }).isFloat({ min: 0 }).withMessage('Sale price must be positive')
       .custom((value, { req }) => {
         if (value !== undefined && req.body.price !== undefined && value >= req.body.price) {
           throw new Error('Sale price must be less than regular price');
@@ -337,6 +337,15 @@ router.post('/:id/sponsor', protect, async (req, res) => {
 
     // 2. Stripe payment
     if (paymentMethod === 'stripe') {
+      // 🔴 KILL SWITCH: Block Stripe sponsorship when Card is disabled
+      const cardEnabledSetting = await Settings.findOne({ key: 'card_enabled' });
+      const cardEnabled = cardEnabledSetting ? cardEnabledSetting.value === 'true' : true;
+      
+      if (!cardEnabled) {
+        return res.status(400).json({
+          error: 'Card payments are currently disabled. Please use wallet or M-Pesa for sponsorship.'
+        });
+      }      
       const paymentIntent = await stripe.paymentIntents.create({
         amount: Math.round(totalAmount * 100),
         currency: 'kes',
