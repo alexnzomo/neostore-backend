@@ -524,8 +524,11 @@ app.post('/api/mpesa/stkpush', protect, async (req, res) => {
         && order.assignedAgentId
         && order.assignedAgentId.toString() === uid;
       const isAdmin = ['admin', 'owner'].includes(req.user.role);
+      const isStationMgr = req.user.role === 'station_manager'
+        && order.deliveryInfo?.type === 'pickup'
+        && order.deliveryInfo?.stationId?.toString() === req.user.stationId?.toString();
 
-      if (!isOwner && !isAssignedAgent && !isAdmin) {
+      if (!isOwner && !isAssignedAgent && !isAdmin && !isStationMgr) {
         return res.status(403).json({ error: 'Not authorized to send STK for this order' });
       }
 
