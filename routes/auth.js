@@ -120,7 +120,10 @@ router.post(
       maxAge: 7 * 24 * 60 * 60 * 1000,
     });
 
-    const csrfToken = req.setCsrfToken();
+    let csrfToken = req.cookies.csrfToken;
+    if (!csrfToken) {
+      csrfToken = req.setCsrfToken();
+    }
 
     res.status(201).json({
       message: 'User registered successfully',
@@ -185,7 +188,10 @@ router.post(
       maxAge: 7 * 24 * 60 * 60 * 1000,
     });
 
-    const csrfToken = req.setCsrfToken();
+    let csrfToken = req.cookies.csrfToken;
+    if (!csrfToken) {
+      csrfToken = req.setCsrfToken();
+    }
 
     res.json({
       message: 'Login successful',
