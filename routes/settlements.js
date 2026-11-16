@@ -4,6 +4,7 @@ const Order = require('../models/Order');
 const User = require('../models/User');
 const PickupStation = require('../models/PickupStation');
 const WalletService = require('../services/walletService');
+const WalletTransaction = require('../models/WalletTransaction');
 const { protect } = require('../middleware/auth');
 const { allowRoles } = require('../middleware/roleCheck');
 const KYC = require('../models/KYC');
