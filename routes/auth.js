@@ -208,12 +208,15 @@ router.get('/me', protect, async (req, res) => {
 });
 
 // GET /api/auth/csrf-token
-router.get('/csrf-token', async (req, res) => { //removed protect middleware to allow unauthenticated users to get CSRF token
+router.get('/csrf-token', async (req, res) => {
   try {
     let token = req.cookies.csrfToken;
     if (!token) {
       token = req.setCsrfToken();
     }
+    res.set('Cache-Control', 'no-store, no-cache, must-revalidate, private');
+    res.set('Pragma', 'no-cache');
+    res.set('Expires', '0');
     res.json({ csrfToken: token });
   } catch (err) {
     res.status(500).json({ error: err.message });
