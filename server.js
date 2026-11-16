@@ -1048,7 +1048,8 @@ async function recoverOrderViaStkQuery(order) {
   try {
     result = await queryStkStatus(order.mpesaCheckoutRequestId);
   } catch (e) {
-    console.error(`[STK recovery] query failed for ${order.orderId}: ${e.message}`);
+    const detail = e.response?.data ? JSON.stringify(e.response.data) : '(no response body)';
+    console.error(`[STK recovery] query failed for ${order.orderId}: ${e.message} | ${detail}`);
     return;
   }
 
@@ -1123,7 +1124,8 @@ async function recoverTopUpViaStkQuery(topUp) {
   try {
     result = await queryStkStatus(topUp.checkoutRequestId);
   } catch (e) {
-    console.error(`[STK recovery] query failed for topup ${topUp._id}: ${e.message}`);
+    const detail = e.response?.data ? JSON.stringify(e.response.data) : '(no response body)';
+    console.error(`[STK recovery] query failed for topup ${topUp._id}: ${e.message} | ${detail}`);
     return;
   }
 
