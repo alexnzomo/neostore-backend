@@ -462,13 +462,23 @@ const MPESA_BASE_URL = process.env.MPESA_BASE_URL
     ? 'https://api.safaricom.co.ke'
     : 'https://sandbox.safaricom.co.ke');
 
+let cachedToken = null;
+let cachedTokenExpiry = 0;
+
 async function getAccessToken() {
+  if (cachedToken && Date.now() < cachedTokenExpiry) {
+    return cachedToken;
+  }
   const auth = Buffer.from(`${CONSUMER_KEY}:${CONSUMER_SECRET}`).toString('base64');
   const response = await axios.get(
     `${MPESA_BASE_URL}/oauth/v1/generate?grant_type=client_credentials`,
     { headers: { Authorization: `Basic ${auth}` } }
   );
-  return response.data.access_token;
+  cachedToken = response.data.access_token;
+  // expires_in is typically 3599 seconds; subtract 60s for safety
+  const expiresIn = parseInt(response.data.expires_in || '3599', 10);
+  cachedTokenExpiry = Date.now() + (expiresIn - 60) * 1000;
+  return cachedToken;
 }
 
 async function initiateMpesaPayment(phoneNumber, amount, accountRef) {
@@ -1171,36 +1181,70 @@ async function recoverTopUpViaStkQuery(topUp) {
   }
 }
 
-cron.schedule('*/2 * * * *', async () => {
+cron.schedule('*/5 * * * *', async () => {
   try {
-    const cutoff = new Date(Date.now() - 3 * 60 * 1000);
+    const cutoff = new Date(Date.now() - 5 * 60 * 1000);
 
     const stuckOrders = await Order.find({
       paymentMethod: { $in: ['mpesa', 'mpesa_deposit'] },
       paymentStatus: 'pending',
       mpesaCheckoutRequestId: { $ne: null },
       createdAt: { $lt: cutoff }
-    }).limit(10);
+    }).limit(3);
 
     for (const order of stuckOrders) {
       await recoverOrderViaStkQuery(order);
+      await new Promise(r => setTimeout(r, 3000));
     }
 
     const stuckTopUps = await TopUpRequest.find({
       status: 'pending',
       checkoutRequestId: { $ne: null },
       createdAt: { $lt: cutoff }
-    }).limit(10);
+    }).limit(3);
 
     for (const topUp of stuckTopUps) {
       await recoverTopUpViaStkQuery(topUp);
+      await new Promise(r => setTimeout(r, 3000));
     }
   } catch (e) {
     console.error('[STK recovery] cron error:', e.message);
   }
 });
 
-console.log('✅ STK recovery cron scheduled (every 2 minutes)');
+cron.schedule('*/15 * * * *', async () => {
+  try {
+    const cutoff = new Date(Date.now() - 30 * 60 * 1000);
+
+    const abandonedTopUps = await TopUpRequest.updateMany(
+      { status: 'pending', createdAt: { $lt: cutoff } },
+      { $set: { status: 'failed' } }
+    );
+
+    const abandonedOrders = await Order.updateMany(
+      {
+        paymentStatus: 'pending',
+        paymentMethod: { $in: ['mpesa', 'mpesa_deposit'] },
+        createdAt: { $lt: cutoff }
+      },
+      {
+        $set: {
+          paymentStatus: 'payment_failed',
+          mpesaFailureReason: 'Auto-failed: no callback received within 30 minutes'
+        }
+      }
+    );
+
+    if (abandonedTopUps.modifiedCount > 0 || abandonedOrders.modifiedCount > 0) {
+      console.log(`[cleanup] Marked ${abandonedTopUps.modifiedCount} top-ups and ${abandonedOrders.modifiedCount} orders as failed`);
+    }
+  } catch (err) {
+    console.error('[cleanup] cron error:', err.message);
+  }
+});
+
+console.log('✅ STK recovery cron scheduled (every 5 minutes, 3 max, 3s delay)');
+console.log('✅ Cleanup cron scheduled (every 15 minutes, 30min stale threshold)');
 
 // ---------- Start server ----------
 const PORT = process.env.PORT || 5000;
