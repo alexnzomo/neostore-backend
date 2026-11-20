@@ -254,6 +254,7 @@ router.post('/topup/initiate', protect, [
             amount: Math.round(amount * 100),          // Paystack uses kobo (1/100 of KES)
             currency: 'KES',
             reference,
+            callback_url: `${process.env.FRONTEND_URL || 'https://www.mwechestore.com'}/account.html?paystack=success`,
             metadata: {
               type: 'wallet_topup',
               userId: userId.toString(),
