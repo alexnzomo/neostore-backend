@@ -15,6 +15,7 @@ const cron = require('node-cron');
 // ========== Models ==========
 const User = require('./models/User');
 const Order = require('./models/Order');
+const Settings = require('./models/Settings');
 const Product = require('./models/Product');
 const TopUpRequest = require('./models/TopUpRequest');
 const PickupStation = require('./models/PickupStation');
@@ -62,6 +63,8 @@ const requiredEnvVars = [
   'JWT_SECRET',
   'STRIPE_SECRET_KEY',
   'STRIPE_PUBLISHABLE_KEY',
+  'PAYSTACK_SECRET_KEY',
+  'PAYSTACK_PUBLIC_KEY',
   'BREVO_API_KEY',
   'BREVO_FROM_EMAIL',
   'CORS_ORIGIN',
@@ -78,7 +81,6 @@ if (missing.length) {
 // ========== App Setup ==========
 const app = express();
 
-// ---------- Security & middleware ----------
 // ---------- Security & middleware ----------
 app.use(
   helmet({
@@ -318,6 +320,245 @@ app.post(
   }
 );
 
+// ---------- Paystack webhook ----------
+app.post(
+  '/api/paystack/webhook',
+  express.raw({ type: 'application/json' }),
+  async (req, res) => {
+    // Paystack signs with HMAC-SHA512 of the raw body using your secret key.
+    const crypto = require('crypto');
+    const hash = crypto
+      .createHmac('sha512', process.env.PAYSTACK_SECRET_KEY)
+      .update(req.body)
+      .digest('hex');
+
+    if (hash !== req.headers['x-paystack-signature']) {
+      console.warn('⚠️ Paystack webhook signature mismatch');
+      return res.status(401).send('Invalid signature');
+    }
+
+    // Parse the verified body
+    let event;
+    try {
+      event = JSON.parse(req.body.toString());
+    } catch (err) {
+      console.error('Paystack webhook parse error:', err.message);
+      return res.status(400).send('Invalid JSON');
+    }
+
+    if (event.event === 'charge.success') {
+      const data = event.data;
+      const reference = data.reference;
+      const paidAmount = data.amount / 100;   // convert kobo to KES
+
+      console.log(`✅ Paystack charge.success: ref=${reference} amount=${paidAmount}`);
+
+      // Find the matching top-up
+      const topUp = await TopUpRequest.findOne({
+        $or: [
+          { paystackReference: reference, status: 'pending' },
+          { merchantRequestId: reference, status: 'pending' }
+        ]
+      });
+
+      if (topUp) {
+        // Verify amount matches
+        if (Math.abs(paidAmount - topUp.amount) > 1) {
+          console.error(`❌ Paystack amount mismatch for topup ${topUp._id}: expected ${topUp.amount}, got ${paidAmount}`);
+          return res.json({ received: true });
+        }
+
+        try {
+          const result = await WalletService.credit(
+            topUp.userId,
+            topUp.amount,
+            `Wallet top-up via Paystack (${reference})`,
+            reference,
+            'topup'
+          );
+          topUp.status = 'completed';
+          await topUp.save();
+
+          await createNotification(
+            topUp.userId,
+            'system',
+            'Wallet top‑up successful',
+            `Your wallet has been credited with KES ${topUp.amount.toFixed(2)} via Paystack.`,
+            '/account.html'
+          );
+
+          console.log(`💰 Paystack wallet credited: KES ${topUp.amount} for user ${topUp.userId}`);
+        } catch (err) {
+          console.error(`❌ Paystack wallet credit failed for topup ${topUp._id}:`, err.message);
+          topUp.status = 'failed';
+          await topUp.save();
+        }
+      } else {
+        // Check if this is an order payment
+        const { orderId } = data.metadata || {};
+        if (orderId) {
+          const order = await Order.findById(orderId);
+          if (!order) {
+            console.log(`⚠️ Paystack: order ${orderId} not found for reference ${reference}`);
+            return res.json({ received: true });
+          }
+
+          const isDeposit = ['card_deposit', 'mpesa_deposit', 'wallet_deposit', 'paystack_deposit'].includes(order.paymentMethod);
+          const expectedDeposit = isDeposit
+            ? Math.round(order.totalKES * ((order.depositPercentage || 0) / 100))
+            : order.totalKES;
+
+          if (Math.abs(paidAmount - expectedDeposit) > 1) {
+            console.error(`❌ Paystack amount mismatch for order ${order.orderId}: expected ${expectedDeposit}, got ${paidAmount}`);
+            return res.json({ received: true });
+          }
+
+          const claimed = await Order.findOneAndUpdate(
+            { _id: order._id, paymentStatus: 'pending' },
+            {
+              $set: {
+                paymentStatus: isDeposit ? 'deposit_paid' : 'fully_paid',
+                depositPaid: isDeposit ? expectedDeposit : order.totalKES,
+                balanceDue: isDeposit ? order.totalKES - expectedDeposit : 0,
+                remainingBalance: isDeposit ? order.totalKES - expectedDeposit : 0,
+                updatedAt: Date.now()
+              }
+            },
+            { new: true }
+          );
+
+          if (!claimed) {
+            console.log(`⚠️ Paystack: order ${order.orderId} already processed`);
+            return res.json({ received: true });
+          }
+
+          console.log(`✅ Order ${order.orderId} paid via Paystack`);
+
+          try { await processReferralReward(claimed); } catch (err) {
+            console.error('Paystack referral reward failed:', err.message);
+          }
+          try { await sendOrderConfirmationEmail(claimed); } catch (err) {
+            console.error('Paystack order email failed:', err.message);
+          }
+        } else {
+          // Check if this is a sponsorship
+          const { type, productId, days } = data.metadata || {};
+          if (type === 'sponsorship' && productId && days) {
+            const SponsorshipRequest = require('./models/SponsorshipRequest');
+            const pendingSponsor = await SponsorshipRequest.findOne({
+              merchantRequestId: reference,
+              status: 'pending'
+            });
+
+            if (!pendingSponsor) {
+              console.log(`⚠️ Paystack sponsorship: no pending request for ref ${reference}`);
+              return res.json({ received: true });
+            }
+
+            // Verify amount matches
+            const feePerDaySetting = await Settings.findOne({ key: 'sponsorshipFeePerDay' });
+            const feePerDay = feePerDaySetting ? feePerDaySetting.value : 150;
+            const expectedAmount = feePerDay * pendingSponsor.days;
+
+            if (Math.abs(paidAmount - expectedAmount) > 1) {
+              console.error(`❌ Paystack sponsorship amount mismatch: expected ${expectedAmount}, got ${paidAmount}`);
+              return res.json({ received: true });
+            }
+
+            const product = await Product.findById(pendingSponsor.productId);
+            if (product) {
+              product.sponsored = true;
+              product.sponsoredUntil = new Date(Date.now() + pendingSponsor.days * 24 * 60 * 60 * 1000);
+              await product.save();
+            }
+            pendingSponsor.status = 'completed';
+            await pendingSponsor.save();
+
+            console.log(`⭐ Product ${pendingSponsor.productId} sponsored for ${pendingSponsor.days} days via Paystack`);
+          } else {
+            console.log(`⚠️ Paystack charge for unknown reference: ${reference}`);
+          }
+        }
+      }
+    }
+
+    res.json({ received: true });
+  }
+);
+
+// ---------- Paystack: initialize order payment ----------
+app.post('/api/paystack/initialize-order', protect, async (req, res) => {
+  const { orderId } = req.body;
+  if (!orderId) {
+    return res.status(400).json({ error: 'orderId required' });
+  }
+
+  try {
+    const order = await Order.findById(orderId);
+    if (!order) return res.status(404).json({ error: 'Order not found' });
+    if (order.customerId.toString() !== req.user._id.toString()) {
+      return res.status(403).json({ error: 'Order does not belong to you' });
+    }
+    if (!['pending', 'payment_failed'].includes(order.paymentStatus)) {
+      return res.status(400).json({ error: `Order cannot accept payment (status: ${order.paymentStatus})` });
+    }
+
+    // Paystack kill switch
+    const psSetting = await Settings.findOne({ key: 'paystack_enabled' });
+    if (psSetting && psSetting.value !== 'true') {
+      return res.status(400).json({ error: 'Card payments are currently disabled.' });
+    }
+
+    const isDeposit = ['paystack_deposit'].includes(order.paymentMethod);
+    const expectedAmount = isDeposit
+      ? Math.round(order.totalKES * ((order.depositPercentage || 0) / 100))
+      : (order.remainingBalance > 0 ? order.remainingBalance : order.totalKES);
+
+    if (expectedAmount < 50) {
+      return res.status(400).json({ error: 'Minimum Paystack payment is KES 50.' });
+    }
+
+    const reference = `ORDER-${order._id}-${Date.now()}`;
+    const FRONTEND_URL = process.env.FRONTEND_URL || 'https://www.mwechestore.com';
+
+    const paystackRes = await axios.post(
+      'https://api.paystack.co/transaction/initialize',
+      {
+        email: req.user.email,
+        amount: Math.round(expectedAmount * 100),
+        currency: 'KES',
+        reference,
+        callback_url: `${FRONTEND_URL}/confirmation.html?paystack=success&orderId=${order._id}`,
+        metadata: {
+          type: 'order',
+          orderId: order._id.toString(),
+          userId: req.user._id.toString()
+        }
+      },
+      {
+        headers: {
+          Authorization: `Bearer ${process.env.PAYSTACK_SECRET_KEY}`,
+          'Content-Type': 'application/json'
+        }
+      }
+    );
+
+    if (!paystackRes.data || !paystackRes.data.status) {
+      console.error('Paystack order init failed:', paystackRes.data);
+      return res.status(502).json({ error: 'Failed to initialize Paystack payment' });
+    }
+
+    res.json({
+      success: true,
+      authorizationUrl: paystackRes.data.data.authorization_url,
+      reference
+    });
+  } catch (err) {
+    console.error('Paystack order init error:', err.response?.data || err.message);
+    res.status(502).json({ error: 'Paystack unavailable. Please try again or use M-Pesa.' });
+  }
+});
+
 // ---------- JSON parser (after webhook) ----------
 app.use(express.json({ limit: '1mb' }));
 
@@ -332,6 +573,7 @@ const csrfExcludedPaths = [
   '/api/auth/login',
   '/api/auth/register',
   '/api/stripe/webhook',
+  '/api/paystack/webhook',
   '/api/mpesa/callback',
   '/api/send-verification',
   '/api/verify-and-register',

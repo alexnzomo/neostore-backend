@@ -5,6 +5,7 @@ const topUpRequestSchema = new mongoose.Schema({
   amount: { type: Number, required: true },
   merchantRequestId: { type: String, required: true },
   checkoutRequestId: { type: String },
+  paystackReference: { type: String, default: null, index: true },   // ← added
   status: { type: String, enum: ['pending', 'completed', 'failed'], default: 'pending' },
   createdAt: { type: Date, default: Date.now }
 });

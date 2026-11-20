@@ -364,7 +364,69 @@ router.post('/:id/sponsor', protect, async (req, res) => {
       });
     }
 
-    // 3. M‑Pesa payment
+    // 3. Paystack payment
+    if (paymentMethod === 'paystack') {
+      // Kill switch
+      const psSetting = await Settings.findOne({ key: 'paystack_enabled' });
+      if (psSetting && psSetting.value !== 'true') {
+        return res.status(400).json({ error: 'Card payments are currently disabled.' });
+      }
+
+      const reference = `SPONSOR-${product._id}-${Date.now()}`;
+      const FRONTEND_URL = process.env.FRONTEND_URL || 'https://www.mwechestore.com';
+
+      try {
+        const paystackRes = await axios.post(
+          'https://api.paystack.co/transaction/initialize',
+          {
+            email: req.user.email,
+            amount: Math.round(totalAmount * 100),
+            currency: 'KES',
+            reference,
+            callback_url: `${FRONTEND_URL}/vendor.html?paystack=success`,
+            metadata: {
+              type: 'sponsorship',
+              productId: product._id.toString(),
+              userId: req.user._id.toString(),
+              days: days.toString(),
+              amount: totalAmount.toString()
+            }
+          },
+          {
+            headers: {
+              Authorization: `Bearer ${process.env.PAYSTACK_SECRET_KEY}`,
+              'Content-Type': 'application/json'
+            }
+          }
+        );
+
+        if (!paystackRes.data || !paystackRes.data.status) {
+          console.error('Paystack sponsorship init failed:', paystackRes.data);
+          return res.status(502).json({ error: 'Failed to initialize Paystack payment' });
+        }
+
+        // Create pending sponsorship request so the webhook can activate it
+        const SponsorshipRequest = require('../models/SponsorshipRequest');
+        await SponsorshipRequest.create({
+          productId: product._id,
+          userId: req.user._id,
+          days,
+          merchantRequestId: reference,
+          status: 'pending'
+        });
+
+        return res.json({
+          success: true,
+          authorizationUrl: paystackRes.data.data.authorization_url,
+          reference
+        });
+      } catch (err) {
+        console.error('Paystack sponsorship init error:', err.response?.data || err.message);
+        return res.status(502).json({ error: 'Paystack unavailable. Please try again or use M-Pesa.' });
+      }
+    }
+
+    // 4. M‑Pesa payment
     if (paymentMethod === 'mpesa') {
       if (!phoneNumber) return res.status(400).json({ error: 'Phone number required for M‑Pesa' });
       const mpesaResponse = await initiateMpesaPayment(phoneNumber, totalAmount, product._id);

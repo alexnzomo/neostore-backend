@@ -1,4 +1,5 @@
 const express = require('express');
+const axios = require('axios');
 const bcrypt = require('bcrypt');
 const jwt = require('jsonwebtoken');
 const { body, validationResult } = require('express-validator');
@@ -178,7 +179,7 @@ router.post('/topup', protect, allowRoles('owner'), [
 // ========== Real Payment Top‑up Initiation (Stripe / M‑Pesa) ==========
 router.post('/topup/initiate', protect, [
   body('amount').isFloat({ min: 1 }).withMessage('Amount must be at least 1 KES'),
-  body('method').isIn(['stripe', 'mpesa']).withMessage('Invalid payment method')
+  body('method').isIn(['stripe', 'mpesa', 'paystack']).withMessage('Invalid payment method')
 ], async (req, res) => {
   const errors = validationResult(req);
   if (!errors.isEmpty()) return res.status(400).json({ errors: errors.array() });
@@ -223,6 +224,75 @@ router.post('/topup/initiate', protect, [
         clientSecret: paymentIntent.client_secret,
         paymentIntentId: paymentIntent.id
       });
+    }
+
+    if (method === 'paystack') {
+      if (amount < 50) {
+        return res.status(400).json({
+          error: 'Minimum Paystack top-up is KES 50.'
+        });
+      }
+
+      // Kill switch — independent of card_enabled so you can disable Paystack
+      // without disabling Stripe (and vice versa)
+      const Settings = require('../models/Settings');
+      const paystackEnabledSetting = await Settings.findOne({ key: 'paystack_enabled' });
+      const paystackEnabled = paystackEnabledSetting ? paystackEnabledSetting.value === 'true' : true;
+      if (!paystackEnabled) {
+        return res.status(400).json({
+          error: 'Card top-up via Paystack is currently disabled. Please use M-Pesa to top up your wallet.'
+        });
+      }
+
+      const reference = `TOPUP-${userId.toString().slice(-8)}-${Date.now()}`;
+
+      try {
+        const paystackRes = await axios.post(
+          'https://api.paystack.co/transaction/initialize',
+          {
+            email: req.user.email,
+            amount: Math.round(amount * 100),          // Paystack uses kobo (1/100 of KES)
+            currency: 'KES',
+            reference,
+            metadata: {
+              type: 'wallet_topup',
+              userId: userId.toString(),
+              amount: amount.toString()
+            }
+          },
+          {
+            headers: {
+              Authorization: `Bearer ${process.env.PAYSTACK_SECRET_KEY}`,
+              'Content-Type': 'application/json'
+            }
+          }
+        );
+
+        if (!paystackRes.data || !paystackRes.data.status) {
+          console.error('Paystack init failed:', paystackRes.data);
+          return res.status(502).json({ error: 'Failed to initialize Paystack payment' });
+        }
+
+        // Persist the reference so the webhook can match this top-up
+        const topUp = new TopUpRequest({
+          userId,
+          amount,
+          merchantRequestId: reference,
+          paystackReference: reference,
+          status: 'pending'
+        });
+        await topUp.save();
+
+        return res.json({
+          success: true,
+          authorizationUrl: paystackRes.data.data.authorization_url,
+          accessCode: paystackRes.data.data.access_code,
+          reference
+        });
+      } catch (err) {
+        console.error('Paystack init error:', err.response?.data || err.message);
+        return res.status(502).json({ error: 'Paystack unavailable. Please try again or use M-Pesa.' });
+      }
     }
 
     if (method === 'mpesa') {

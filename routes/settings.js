@@ -263,7 +263,7 @@ async function getPaymentStatus(key) {
 }
 
 router.get('/payments/:method', async (req, res) => {
-  const validMethods = ['card_enabled', 'mpesa_enabled', 'wallet_enabled', 'manual_mpesa_enabled', 'bank_transfer_enabled'];
+  const validMethods = ['card_enabled', 'mpesa_enabled', 'wallet_enabled', 'manual_mpesa_enabled', 'bank_transfer_enabled', 'paystack_enabled'];
   if (!validMethods.includes(req.params.method)) {
     return res.status(400).json({ error: 'Invalid method' });
   }
@@ -272,7 +272,7 @@ router.get('/payments/:method', async (req, res) => {
 });
 
 router.put('/payments/:method', protect, allowRoles('owner'), async (req, res) => {
-  const validMethods = ['card_enabled', 'mpesa_enabled', 'wallet_enabled', 'manual_mpesa_enabled', 'bank_transfer_enabled'];
+  const validMethods = ['card_enabled', 'mpesa_enabled', 'wallet_enabled', 'manual_mpesa_enabled', 'bank_transfer_enabled', 'paystack_enabled'];
   if (!validMethods.includes(req.params.method)) {
     return res.status(400).json({ error: 'Invalid method' });
   }

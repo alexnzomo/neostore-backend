@@ -4,6 +4,7 @@ const Order = require('../models/Order');
 const User = require('../models/User');
 const PickupStation = require('../models/PickupStation');
 const WalletService = require('../services/walletService');
+const Settings = require('../models/Settings');
 const WalletTransaction = require('../models/WalletTransaction');
 const { protect } = require('../middleware/auth');
 const { allowRoles } = require('../middleware/roleCheck');
@@ -76,6 +77,30 @@ router.put('/:id/paid', protect, allowRoles('admin', 'owner'), async (req, res) 
     const { type } = req.body;
     const settlement = await Settlement.findById(req.params.id);
     if (!settlement) return res.status(404).json({ error: 'Settlement not found' });
+
+    // ===== Withdrawal-style approval policy =====
+    // Only the owner, or admins explicitly flagged with canApproveWithdrawals,
+    // can approve/reject/complete settlements. Non-owner admins are further
+    // limited by the amount threshold (same setting as withdrawals).
+    if (req.user.role !== 'owner') {
+      if (!req.user.canApproveWithdrawals) {
+        return res.status(403).json({
+          error: 'You do not have permission to manage settlements. Contact a senior administrator.'
+        });
+      }
+      const thresholdSetting = await Settings.findOne({ key: 'withdrawal_approval_threshold' });
+      const threshold = thresholdSetting ? thresholdSetting.value : 20000;
+      const payoutAmount =
+        type === 'vendor' ? settlement.vendorEarnings :
+        type === 'agent' ? settlement.agentEarnings :
+        type === 'station' ? settlement.stationEarnings : 0;
+      if (payoutAmount > threshold) {
+        return res.status(403).json({
+          error: `Settlements above KES ${threshold} require senior approval. This one is KES ${payoutAmount}.`
+        });
+      }
+    }
+    // ===== End policy check =====
 
     let userId = null;
     let amount = 0;

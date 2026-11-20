@@ -72,7 +72,7 @@ const orderSchema = new mongoose.Schema({
   },  
   paymentMethod: { 
     type: String, 
-    enum: ['card', 'mpesa', 'cash_on_delivery', 'card_deposit', 'mpesa_deposit', 'wallet', 'wallet_deposit', 'mpesa_on_delivery'],
+    enum: ['card', 'mpesa', 'cash_on_delivery', 'card_deposit', 'mpesa_deposit', 'wallet', 'wallet_deposit', 'mpesa_on_delivery', 'paystack', 'paystack_deposit'],
     required: true 
   },
   depositPaid: { type: Number, default: 0, min: 0 },
