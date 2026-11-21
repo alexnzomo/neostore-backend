@@ -254,7 +254,7 @@ router.post(
     body('paymentMethod').isIn([
       'card', 'mpesa', 'cash_on_delivery',
       'card_deposit', 'mpesa_deposit', 'wallet', 'wallet_deposit',
-      'mpesa_on_delivery'
+      'mpesa_on_delivery', 'paystack', 'paystack_deposit'
     ]).withMessage('Invalid payment method'),
     body('depositPercentage').optional().isFloat({ min: 0, max: 100 }).withMessage('Deposit must be 0-100'),
     body('discountAmountKES').optional().isFloat({ min: 0 }).withMessage('Discount must be non‑negative'),
