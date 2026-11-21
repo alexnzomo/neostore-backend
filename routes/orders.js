@@ -559,12 +559,12 @@ router.post(
       let balanceDue = totalKES;
       let paymentStatus = 'pending';
 
-      if (paymentMethod === 'card_deposit' || paymentMethod === 'mpesa_deposit' || paymentMethod === 'wallet_deposit') {
+      if (paymentMethod === 'card_deposit' || paymentMethod === 'mpesa_deposit' || paymentMethod === 'wallet_deposit' || paymentMethod === 'paystack_deposit') {
         // Deposit amount expected, but not yet collected.
         // Gateway callback / webhook will set depositPaid + balanceDue.
         balanceDue = totalKES;
         paymentStatus = 'pending';
-      } else if (paymentMethod === 'card' || paymentMethod === 'mpesa' || paymentMethod === 'wallet') {
+      } else if (paymentMethod === 'card' || paymentMethod === 'mpesa' || paymentMethod === 'wallet' || paymentMethod === 'paystack') {
         // Full amount expected, but not yet collected.
         balanceDue = totalKES;
         paymentStatus = 'pending';
